@@ -2,8 +2,9 @@ class AccessibilityMVP {
   constructor(options = {}) {
     this.options = {
       cursorSize: 28,
-      cursorSpeed: 12,
+      cursorSpeed: 18,
       blinkClickCount: 2,
+      dwellTime: 1200,
       ...options
     };
 
@@ -14,13 +15,21 @@ class AccessibilityMVP {
     this.canvas = null;
     this.cursor = null;
     this.stream = null;
+    this.faceLandmarker = null;
+    this.eyeLoopId = null;
 
     this.eye = {
       lastX: null,
       lastY: null,
       lastMove: 0,
       blinkTimes: [],
-      lastBlink: 0
+      lastBlink: 0,
+      gazeX: null,
+      gazeY: null,
+      dwellTarget: null,
+      dwellStartedAt: 0,
+      dwellLockedTarget: null,
+      lastFaceStatus: 0
     };
 
     this.cursorPosition = {
@@ -40,14 +49,16 @@ class AccessibilityMVP {
     const style = document.createElement("style");
     style.textContent = `
       #a11y-mvp-button {
-        position:fixed; right:20px; bottom:20px; z-index:2147483647;
-        width:58px; height:58px; border-radius:50%; border:0;
+        position:fixed; right:max(12px, env(safe-area-inset-right));
+        bottom:max(12px, env(safe-area-inset-bottom)); z-index:2147483647;
+        width:56px; height:56px; border-radius:50%; border:0;
         background:#1455d9; color:#fff; font-size:25px; cursor:pointer;
         box-shadow:0 4px 18px #0005;
       }
       #a11y-mvp-panel {
-        position:fixed; right:20px; bottom:88px; z-index:2147483646;
-        width:310px; max-width:calc(100vw - 40px); padding:18px;
+        position:fixed; right:max(12px, env(safe-area-inset-right));
+        bottom:calc(max(12px, env(safe-area-inset-bottom)) + 68px);
+        z-index:2147483646; width:min(310px, calc(100vw - 24px)); padding:16px;
         background:#fff; color:#111; border:1px solid #ccc; border-radius:14px;
         box-shadow:0 8px 30px #0003; display:none;
         font:14px Arial,sans-serif;
@@ -56,18 +67,31 @@ class AccessibilityMVP {
       #a11y-mvp-panel h2 { margin:0 0 14px; font-size:19px; }
       .a11y-row { display:flex; align-items:center; justify-content:space-between;
         gap:10px; padding:12px 0; border-top:1px solid #eee; }
-      .a11y-row button { padding:8px 12px; cursor:pointer; }
-      #a11y-status { font-size:12px; color:#555; margin-top:12px; }
+      .a11y-row button { padding:10px 12px; min-height:44px; cursor:pointer; }
+      #a11y-status { font-size:12px; color:#444; margin-top:12px; }
       #a11y-eye-cursor {
         position:fixed; z-index:2147483645; width:28px; height:28px;
         border:3px solid #1455d9; border-radius:50%; pointer-events:none;
         transform:translate(-50%,-50%); display:none;
-        box-sizing:border-box; background:#fff8;
+        box-sizing:border-box; background:#fff8; transition:width .12s, height .12s;
       }
       #a11y-eye-preview {
         position:fixed; left:10px; bottom:10px; z-index:2147483644;
         width:180px; height:135px; object-fit:cover; border-radius:10px;
         border:2px solid #1455d9; display:none; background:#000;
+        transform:scaleX(-1);
+      }
+      @media (max-width:600px) {
+        #a11y-eye-preview {
+          left:auto; right:max(8px, env(safe-area-inset-right));
+          top:max(8px, env(safe-area-inset-top)); bottom:auto;
+          width:104px; height:78px; border-radius:8px;
+        }
+        #a11y-mvp-panel {
+          padding:14px; max-height:70vh; max-height:min(70dvh, 520px); overflow:auto;
+        }
+        .a11y-row { gap:8px; }
+        .a11y-row button { flex:0 0 auto; }
       }
     `;
     document.head.appendChild(style);
@@ -91,7 +115,7 @@ class AccessibilityMVP {
       <div class="a11y-row">
         <div>
           <strong>Navegação por olhos</strong><br>
-          <small>Olhe para mover o cursor; duas piscadas clicam.</small>
+          <small>Mova os olhos e mantenha o olhar sobre um item para clicar.</small>
         </div>
         <button id="a11y-eye-toggle" type="button">Ativar</button>
       </div>
@@ -104,7 +128,7 @@ class AccessibilityMVP {
         <button id="a11y-voice-toggle" type="button">Ativar</button>
       </div>
 
-      <div id="a11y-status">Status: pronto</div>
+      <div id="a11y-status" role="status" aria-live="polite">Status: pronto</div>
     `;
 
     this.cursor = document.createElement("div");
@@ -121,7 +145,8 @@ class AccessibilityMVP {
 
   bindUI() {
     this.button.addEventListener("click", () => {
-      this.panel.classList.toggle("open");
+      const isOpen = this.panel.classList.toggle("open");
+      this.button.setAttribute("aria-expanded", String(isOpen));
     });
 
     this.panel.querySelector("#a11y-eye-toggle")
@@ -158,39 +183,66 @@ class AccessibilityMVP {
       this.setStatus("este navegador não permite acesso à câmera");
       return;
     }
+    if (!window.isSecureContext) {
+      this.setStatus("a câmera exige HTTPS ou localhost");
+      return;
+    }
 
     try {
       this.setStatus("solicitando permissão da câmera...");
       this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30, max: 30 }
+        },
         audio: false
       });
 
       this.preview.srcObject = this.stream;
       this.preview.style.display = "block";
+      await this.preview.play();
+      this.setStatus("carregando rastreamento ocular...");
+      const vision = await import(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14"
+      );
+      const fileset = await vision.FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      this.faceLandmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+
+      this.preview.style.display = "block";
       this.cursor.style.display = "block";
       this.eyeEnabled = true;
-
       this.panel.querySelector("#a11y-eye-toggle").textContent = "Desativar";
-      this.setStatus("câmera ativa — MVP aguardando rastreamento");
-
-      /*
-       * IMPORTANTE:
-       * A câmera sozinha não fornece coordenadas dos olhos.
-       * Para transformar isso em navegação real, conecte aqui
-       * um modelo de face/eye tracking (MediaPipe, TF.js etc.).
-       *
-       * Este MVP já deixa a câmera, cursor e ciclo de ativação prontos.
-       */
-      this.startDemoCursor();
+      this.setStatus("rastreamento ativo — mantenha o olhar sobre um item para clicar");
+      this.startEyeTracking();
     } catch (error) {
-      this.setStatus("permissão da câmera negada ou indisponível");
       console.error(error);
+      this.stopEyes();
+      this.setStatus(error.name === "NotAllowedError"
+        ? "permissão da câmera negada"
+        : "falha ao iniciar rastreamento; verifique câmera e rede");
     }
   }
 
   stopEyes() {
     this.eyeEnabled = false;
+    if (this.eyeLoopId !== null) {
+      cancelAnimationFrame(this.eyeLoopId);
+      this.eyeLoopId = null;
+    }
+    if (this.faceLandmarker) {
+      this.faceLandmarker.close();
+      this.faceLandmarker = null;
+    }
     if (this.stream) {
       this.stream.getTracks().forEach(track => track.stop());
       this.stream = null;
@@ -198,28 +250,117 @@ class AccessibilityMVP {
     this.preview.srcObject = null;
     this.preview.style.display = "none";
     this.cursor.style.display = "none";
+    this.eye.dwellTarget = null;
+    this.eye.dwellLockedTarget = null;
     this.panel.querySelector("#a11y-eye-toggle").textContent = "Ativar";
     this.setStatus("navegação por olhos desativada");
   }
 
-  startDemoCursor() {
-    /*
-     * Demonstração temporária:
-     * move o cursor suavemente usando o mouse.
-     * Substitua este bloco pelo resultado X/Y do eye tracker.
-     */
-    const move = (event) => {
-      if (!this.eyeEnabled) return;
-      this.cursorPosition.x = event.clientX;
-      this.cursorPosition.y = event.clientY;
-      this.updateCursor();
+  startEyeTracking() {
+    let lastDetection = 0;
+    const track = (now) => {
+      if (!this.eyeEnabled || !this.faceLandmarker) return;
+      this.eyeLoopId = requestAnimationFrame(track);
+
+      if (now - lastDetection < 33 || this.preview.readyState < 2) return;
+      lastDetection = now;
+
+      const result = this.faceLandmarker.detectForVideo(this.preview, now);
+      const landmarks = result.faceLandmarks?.[0];
+      if (!landmarks || landmarks.length < 478) {
+        if (now - this.eye.lastFaceStatus > 2000) {
+          this.setStatus("rosto não detectado — centralize o rosto na câmera");
+          this.eye.lastFaceStatus = now;
+        }
+        this.eye.dwellTarget = null;
+        this.cursor.style.width = "28px";
+        this.cursor.style.height = "28px";
+        return;
+      }
+
+      const gaze = this.getGazePosition(landmarks);
+      if (this.eye.gazeX === null) {
+        this.eye.gazeX = gaze.x;
+        this.eye.gazeY = gaze.y;
+      } else {
+        this.eye.gazeX += (gaze.x - this.eye.gazeX) * 0.28;
+        this.eye.gazeY += (gaze.y - this.eye.gazeY) * 0.28;
+      }
+
+      this.updateEyePosition(this.eye.gazeX, this.eye.gazeY);
+      this.updateDwellClick(now);
     };
 
-    window.addEventListener("mousemove", move);
+    this.eyeLoopId = requestAnimationFrame(track);
+  }
 
-    this._removeDemoMouse = () => {
-      window.removeEventListener("mousemove", move);
+  getGazePosition(landmarks) {
+    const eyes = [
+      { iris: 468, corners: [33, 133], lids: [159, 145] },
+      { iris: 473, corners: [362, 263], lids: [386, 374] }
+    ];
+    const positions = eyes.map(({ iris, corners, lids }) => {
+      const irisPoint = landmarks[iris];
+      const cornerPoints = corners.map(index => landmarks[index]);
+      const lidPoints = lids.map(index => landmarks[index]);
+      const left = Math.min(cornerPoints[0].x, cornerPoints[1].x);
+      const right = Math.max(cornerPoints[0].x, cornerPoints[1].x);
+      const top = Math.min(lidPoints[0].y, lidPoints[1].y);
+      const bottom = Math.max(lidPoints[0].y, lidPoints[1].y);
+
+      return {
+        x: 1 - (irisPoint.x - left) / Math.max(right - left, 0.001),
+        y: (irisPoint.y - top) / Math.max(bottom - top, 0.001)
+      };
+    });
+
+    return {
+      x: Math.max(0, Math.min(1, (positions[0].x + positions[1].x) / 2)),
+      y: Math.max(0, Math.min(1, (positions[0].y + positions[1].y) / 2))
     };
+  }
+
+  updateDwellClick(now) {
+    const element = document.elementFromPoint(
+      this.cursorPosition.x,
+      this.cursorPosition.y
+    );
+    const target = element?.closest(
+      "button, a, input, select, textarea, [role='button'], label"
+    );
+
+    if (!target) {
+      this.eye.dwellTarget = null;
+      this.eye.dwellLockedTarget = null;
+      this.cursor.style.width = "28px";
+      this.cursor.style.height = "28px";
+      return;
+    }
+    if (target !== this.eye.dwellLockedTarget) {
+      this.eye.dwellLockedTarget = null;
+    }
+    if (target === this.eye.dwellLockedTarget) return;
+    if (target !== this.eye.dwellTarget) {
+      this.eye.dwellTarget = target;
+      this.eye.dwellStartedAt = now;
+      return;
+    }
+
+    const progress = Math.min(
+      1,
+      (now - this.eye.dwellStartedAt) / this.options.dwellTime
+    );
+    const size = 28 + progress * 12;
+    this.cursor.style.width = `${size}px`;
+    this.cursor.style.height = `${size}px`;
+
+    if (progress >= 1) {
+      this.eye.dwellLockedTarget = target;
+      this.eye.dwellTarget = null;
+      this.cursor.style.width = "28px";
+      this.cursor.style.height = "28px";
+      this.clickAtCursor();
+    }
   }
 
   async toggleVoice() {
@@ -232,37 +373,52 @@ class AccessibilityMVP {
       window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      this.setStatus("reconhecimento de voz não suportado neste navegador");
+      this.setStatus("voz indisponível neste navegador; tente Chrome ou Edge");
+      return;
+    }
+    if (!window.isSecureContext) {
+      this.setStatus("o microfone exige HTTPS ou localhost");
       return;
     }
 
     this.recognition = new SpeechRecognition();
-    this.recognition.lang = "pt-BR";
-    this.recognition.continuous = true;
-    this.recognition.interimResults = false;
+    const recognition = this.recognition;
+    recognition.lang = "pt-BR";
+    recognition.continuous = true;
+    recognition.interimResults = false;
 
-    this.recognition.onresult = (event) => {
+    recognition.onresult = (event) => {
       const result = event.results[event.results.length - 1][0].transcript.trim();
       this.setStatus(`voz: "${result}"`);
       this.executeVoiceCommand(result);
     };
 
-    this.recognition.onerror = (event) => {
+    recognition.onerror = (event) => {
       console.warn("SpeechRecognition:", event.error);
       if (event.error !== "aborted") {
         this.setStatus(`erro de voz: ${event.error}`);
       }
+      if (["not-allowed", "service-not-allowed", "audio-capture"].includes(event.error)) {
+        this.voiceEnabled = false;
+        this.panel.querySelector("#a11y-voice-toggle").textContent = "Ativar";
+      }
     };
 
-    this.recognition.onend = () => {
-      if (this.voiceEnabled) {
-        try { this.recognition.start(); } catch (_) {}
-      }
+    recognition.onend = () => {
+      if (!this.voiceEnabled || this.recognition !== recognition) return;
+      this.voiceRestartTimer = setTimeout(() => {
+        if (!this.voiceEnabled || this.recognition !== recognition) return;
+        try {
+          recognition.start();
+        } catch (error) {
+          this.setStatus("não foi possível reiniciar o microfone");
+        }
+      }, 300);
     };
 
     try {
       this.voiceEnabled = true;
-      this.recognition.start();
+      recognition.start();
       this.panel.querySelector("#a11y-voice-toggle").textContent = "Desativar";
       this.setStatus("escutando comandos...");
     } catch (error) {
@@ -273,6 +429,8 @@ class AccessibilityMVP {
 
   stopVoice() {
     this.voiceEnabled = false;
+    clearTimeout(this.voiceRestartTimer);
+    this.voiceRestartTimer = null;
     if (this.recognition) {
       this.recognition.stop();
       this.recognition = null;
@@ -282,19 +440,16 @@ class AccessibilityMVP {
   }
 
   executeVoiceCommand(command) {
-    const text = command
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
+    const text = this.normalizeText(command);
 
     if (text.startsWith("clicar em ") || text.startsWith("clique em ")) {
-      const targetName = text.replace(/^clique? em /, "").trim();
+      const targetName = text.replace(/^cli(?:car|que) em /, "").trim();
       this.clickByText(targetName);
       return;
     }
 
     if (text.startsWith("preencher ")) {
-      this.fillFieldByVoice(text);
+      this.fillFieldByVoice(command.trim());
       return;
     }
 
@@ -318,17 +473,22 @@ class AccessibilityMVP {
     }
   }
 
+  normalizeText(text) {
+    return String(text)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+  }
+
   clickByText(targetName) {
     const candidates = [
       ...document.querySelectorAll("button, a, [role='button'], input[type='submit']")
     ];
 
     const target = candidates.find(el => {
-      const label = (el.innerText || el.value || el.getAttribute("aria-label") || "")
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .trim();
+      const label = this.normalizeText(
+        el.innerText || el.value || el.getAttribute("aria-label") || ""
+      ).trim();
 
       return label === targetName || label.includes(targetName);
     });
@@ -351,7 +511,7 @@ class AccessibilityMVP {
       return;
     }
 
-    const fieldName = match[1].trim();
+    const fieldName = this.normalizeText(match[1].trim());
     const value = match[2].trim();
 
     const fields = [...document.querySelectorAll("input, textarea, select")];
@@ -367,16 +527,22 @@ class AccessibilityMVP {
     }
 
     if (field.tagName === "SELECT") {
+      const normalizedValue = this.normalizeText(value);
       const option = [...field.options].find(o =>
-        o.textContent.toLowerCase().includes(value)
+        this.normalizeText(o.textContent).includes(normalizedValue)
       );
-      if (option) field.value = option.value;
+      if (!option) {
+        this.setStatus(`opção "${value}" não encontrada`);
+        return;
+      }
+      field.value = option.value;
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      field.dispatchEvent(new Event("change", { bubbles: true }));
     } else {
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype, "value"
-      )?.set || Object.getOwnPropertyDescriptor(
-        HTMLTextAreaElement.prototype, "value"
-      )?.set;
+      const prototype = field instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
 
       if (setter) setter.call(field, value);
       else field.value = value;
@@ -391,27 +557,18 @@ class AccessibilityMVP {
 
   getFieldLabel(field) {
     if (field.labels?.length) {
-      return field.labels[0].innerText.toLowerCase();
+      return this.normalizeText(field.labels[0].innerText);
     }
 
-    return [
+    return this.normalizeText([
       field.name,
       field.id,
       field.placeholder,
       field.getAttribute("aria-label")
-    ].filter(Boolean).join(" ").toLowerCase();
+    ].filter(Boolean).join(" "));
   }
 
-  /*
-   * API pública para o futuro eye tracker:
-   *
-   * Quando seu modelo entregar uma posição normalizada,
-   * chame:
-   *
-   * accessibility.updateEyePosition(x, y)
-   *
-   * onde x e y ficam entre 0 e 1.
-   */
+  // Atualiza o cursor com coordenadas normalizadas fornecidas pelo rastreador.
   updateEyePosition(x, y) {
     if (!this.eyeEnabled) return;
 
