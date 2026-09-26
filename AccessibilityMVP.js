@@ -1,3442 +1,3742 @@
+/**
+ * ================================================================
+ * ACCESSIBILITY MVP
+ * ================================================================
+ *
+ * CURSOR CONTROLADO PELA CABEÇA
+ *
+ * - MediaPipe Face Landmarker
+ * - Calibração individual
+ * - Centro / esquerda / direita / cima / baixo
+ * - Zona morta
+ * - Suavização
+ * - Velocidade proporcional ao movimento
+ * - Dwell click
+ * - Clique por aceno da cabeça
+ * - Cursor virtual
+ *
+ * Requer:
+ * - HTTPS ou localhost
+ * - Chrome/Edge moderno
+ * - câmera frontal
+ * ================================================================
+ */
+
 class AccessibilityMVP {
-  constructor(options = {}) {
-    this.options = {
-      cursorSize: 28,
-      dwellTime: 1200,
-      smoothing: 0.18,
-
-      // Quantidade de pontos usados na calibração
-      calibrationPoints: 9,
 
-      // Quantidade de amostras coletadas por ponto
-      calibrationSamples: 25,
+    constructor(options = {}) {
 
-      // Tempo entre pontos de calibração
-      calibrationPointTime: 1000,
-
-      // Margem para impedir o cursor de ficar exatamente na borda
-      screenMargin: 20,
-
-      ...options
-    };
-
-    // ============================
-    // ESTADO GERAL
-    // ============================
+        this.options = {
 
-    this.voiceEnabled = false;
-    this.eyeEnabled = false;
-
-    this.recognition = null;
-    this.voiceRestartTimer = null;
-
-    this.video = null;
-    this.canvas = null;
-    this.cursor = null;
-    this.preview = null;
-    this.stream = null;
-
-    this.faceLandmarker = null;
-    this.eyeLoopId = null;
-
-    this.button = null;
-    this.panel = null;
-
-    // ============================
-    // ESTADO DOS OLHOS
-    // ============================
-
-    this.eye = {
-      gazeX: null,
-      gazeY: null,
+            // Cursor
+            cursorSize: 34,
+            maxSpeed: 15,
+            sensitivity: 1.0,
 
-      rawX: null,
-      rawY: null,
+            // Movimento
+            deadZone: 0.08,
+            smoothing: 0.22,
 
-      lastFaceStatus: 0,
+            // Dwell
+            dwellEnabled: true,
+            dwellTime: 1400,
 
-      dwellTarget: null,
-      dwellStartedAt: 0,
-      dwellLockedTarget: null,
+            // Aceno
+            nodEnabled: true,
+            nodThreshold: 0.07,
+            clickCooldown: 700,
 
-      lastClick: 0,
+            // Interface
+            showPanel: true,
+            showCameraPreview: true,
 
-      // Dados da calibração
-      calibration: {
-        active: false,
-        pointIndex: 0,
-        points: [],
-        samples: [],
-        timer: null
-      }
-    };
+            ...options
+        };
 
-    // ============================
-    // POSIÇÃO DO CURSOR
-    // ============================
 
-    this.cursorPosition = {
-      x: Math.max(30, window.innerWidth / 2),
-      y: Math.max(30, window.innerHeight / 2)
-    };
+        // ==========================================================
+        // CÂMERA
+        // ==========================================================
 
-    // ============================
-    // CALIBRAÇÃO
-    // ============================
+        this.cameraEnabled = false;
 
-    this.calibration = {
-      points: [
-        { x: 0.10, y: 0.10 },
-        { x: 0.50, y: 0.10 },
-        { x: 0.90, y: 0.10 },
+        this.stream = null;
 
-        { x: 0.10, y: 0.50 },
-        { x: 0.50, y: 0.50 },
-        { x: 0.90, y: 0.50 },
+        this.video = null;
 
-        { x: 0.10, y: 0.90 },
-        { x: 0.50, y: 0.90 },
-        { x: 0.90, y: 0.90 }
-      ],
+        this.videoAnimationFrame = null;
 
-      samples: [],
+        this.cursorAnimationFrame = null;
 
-      minX: 0.15,
-      maxX: 0.85,
-      minY: 0.15,
-      maxY: 0.85,
 
-      calibrated: false
-    };
-  }
+        // ==========================================================
+        // MEDIAPIPE
+        // ==========================================================
 
-  // ============================================================
-  // INIT
-  // ============================================================
+        this.faceLandmarker = null;
 
-  init() {
-    this.injectStyles();
-    this.createUI();
-    this.bindUI();
-    this.updateCursor();
+        this.lastVideoTime = -1;
 
-    this.setStatus("pronto");
-  }
 
-  // ============================================================
-  // CSS
-  // ============================================================
+        // ==========================================================
+        // POSE DA CABEÇA
+        // ==========================================================
 
-  injectStyles() {
-    const style = document.createElement("style");
+        this.currentYaw = 0;
 
-    style.textContent = `
-      #a11y-mvp-button {
-        position: fixed;
-        right: max(12px, env(safe-area-inset-right));
-        bottom: max(12px, env(safe-area-inset-bottom));
-        z-index: 2147483647;
+        this.currentPitch = 0;
 
-        width: 58px;
-        height: 58px;
+        this.filteredYaw = 0;
 
-        border-radius: 50%;
-        border: 0;
+        this.filteredPitch = 0;
 
-        background: #1455d9;
-        color: #fff;
 
-        font-size: 25px;
-        cursor: pointer;
+        // ==========================================================
+        // CALIBRAÇÃO
+        // ==========================================================
 
-        box-shadow: 0 4px 18px #0005;
+        this.isCalibrated = false;
 
-        touch-action: manipulation;
-      }
+        this.calibrationRunning = false;
 
-      #a11y-mvp-panel {
-        position: fixed;
+        this.calibrationStep = 0;
 
-        right: max(12px, env(safe-area-inset-right));
+        this.calibrationSamples = [];
 
-        bottom:
-          calc(
-            max(12px, env(safe-area-inset-bottom)) + 70px
-          );
+        this.calibration = {
 
-        z-index: 2147483646;
+            centerYaw: 0,
+            centerPitch: 0,
 
-        width: min(340px, calc(100vw - 24px));
+            leftYaw: 0,
+            rightYaw: 0,
 
-        max-height: min(80vh, 650px);
+            upPitch: 0,
+            downPitch: 0
+        };
 
-        overflow-y: auto;
 
-        padding: 16px;
+        /*
+         * Quantidade de frames utilizados
+         * para cada ponto da calibração.
+         */
 
-        background: #fff;
-        color: #111;
+        this.calibrationSampleCount = 45;
 
-        border: 1px solid #ccc;
-        border-radius: 14px;
 
-        box-shadow: 0 8px 30px #0003;
+        // ==========================================================
+        // CURSOR
+        // ==========================================================
 
-        display: none;
+        this.cursorX =
+            window.innerWidth / 2;
 
-        font: 14px Arial, sans-serif;
+        this.cursorY =
+            window.innerHeight / 2;
 
-        box-sizing: border-box;
-      }
+        this.targetCursorX =
+            this.cursorX;
 
-      #a11y-mvp-panel.open {
-        display: block;
-      }
+        this.targetCursorY =
+            this.cursorY;
 
-      #a11y-mvp-panel h2 {
-        margin: 0 0 14px;
-        font-size: 19px;
-      }
+        this.cursorVelocityX = 0;
 
-      .a11y-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
+        this.cursorVelocityY = 0;
 
-        gap: 10px;
 
-        padding: 12px 0;
+        // ==========================================================
+        // DWELL
+        // ==========================================================
 
-        border-top: 1px solid #eee;
-      }
+        this.dwellTarget = null;
 
-      .a11y-row:first-of-type {
-        border-top: 0;
-      }
+        this.dwellStartedAt = 0;
 
-      .a11y-row > div {
-        flex: 1;
-      }
+        this.dwellTimer = null;
 
-      .a11y-row button {
-        padding: 10px 12px;
 
-        min-height: 44px;
+        // ==========================================================
+        // CLIQUE
+        // ==========================================================
 
-        cursor: pointer;
+        this.lastClickTime = 0;
 
-        border: 1px solid #bbb;
 
-        border-radius: 8px;
+        // ==========================================================
+        // NOD
+        // ==========================================================
 
-        background: #f7f7f7;
+        this.nodState = "neutral";
 
-        touch-action: manipulation;
-      }
+        this.nodStartedAt = 0;
 
-      .a11y-row button:hover {
-        background: #eee;
-      }
 
-      #a11y-status {
-        font-size: 12px;
-        color: #444;
+        // ==========================================================
+        // UI
+        // ==========================================================
 
-        margin-top: 12px;
+        this.panel = null;
 
-        padding: 10px;
+        this.statusElement = null;
 
-        background: #f5f5f5;
+        this.cursorElement = null;
 
-        border-radius: 8px;
+        this.dwellElement = null;
 
-        line-height: 1.4;
-      }
+        this.cameraContainer = null;
 
-      #a11y-eye-cursor {
-        position: fixed;
+        this.calibrationOverlay = null;
 
-        z-index: 2147483645;
+        this.debugElement = null;
 
-        width: 28px;
-        height: 28px;
 
-        border: 3px solid #1455d9;
+        // ==========================================================
+        // INIT
+        // ==========================================================
 
-        border-radius: 50%;
-
-        pointer-events: none;
-
-        transform: translate(-50%, -50%);
-
-        display: none;
-
-        box-sizing: border-box;
-
-        background: #fff8;
-
-        transition:
-          width .12s,
-          height .12s,
-          border-color .12s,
-          background .12s;
-      }
-
-      #a11y-eye-preview {
-        position: fixed;
-
-        left: 10px;
-        bottom: 10px;
-
-        z-index: 2147483644;
-
-        width: 180px;
-        height: 135px;
-
-        object-fit: cover;
-
-        border-radius: 10px;
-
-        border: 2px solid #1455d9;
-
-        display: none;
-
-        background: #000;
-
-        transform: scaleX(-1);
-      }
-
-      #a11y-calibration {
-        position: fixed;
-
-        inset: 0;
-
-        z-index: 2147483643;
-
-        display: none;
-
-        background: rgba(0, 0, 0, 0.88);
-
-        color: white;
-      }
-
-      #a11y-calibration.open {
-        display: block;
-      }
-
-      #a11y-calibration-instruction {
-        position: fixed;
-
-        top: 20px;
-        left: 50%;
-
-        transform: translateX(-50%);
-
-        width: min(90vw, 500px);
-
-        text-align: center;
-
-        font: bold 18px Arial, sans-serif;
-
-        line-height: 1.4;
-
-        z-index: 2147483647;
-      }
-
-      #a11y-calibration-dot {
-        position: fixed;
-
-        width: 42px;
-        height: 42px;
-
-        border-radius: 50%;
-
-        background: #fff;
-
-        border: 6px solid #1455d9;
-
-        box-shadow:
-          0 0 0 8px rgba(20, 85, 217, .25),
-          0 0 30px rgba(255,255,255,.8);
-
-        transform: translate(-50%, -50%);
-
-        transition:
-          left .25s ease,
-          top .25s ease;
-
-        z-index: 2147483647;
-      }
-
-      #a11y-calibration-progress {
-        position: fixed;
-
-        left: 50%;
-        bottom: 30px;
-
-        transform: translateX(-50%);
-
-        font: 14px Arial, sans-serif;
-
-        color: #ddd;
-
-        z-index: 2147483647;
-      }
-
-      #a11y-calibration-cancel {
-        position: fixed;
-
-        right: 20px;
-        bottom: 20px;
-
-        z-index: 2147483647;
-
-        padding: 12px 16px;
-
-        border: 0;
-
-        border-radius: 8px;
-
-        cursor: pointer;
-      }
-
-      @media (max-width: 600px) {
-
-        #a11y-eye-preview {
-          left: auto;
-
-          right: max(
-            8px,
-            env(safe-area-inset-right)
-          );
-
-          top: max(
-            8px,
-            env(safe-area-inset-top)
-          );
-
-          bottom: auto;
-
-          width: 110px;
-          height: 82px;
-
-          border-radius: 8px;
-        }
-
-        #a11y-mvp-panel {
-          padding: 14px;
-
-          max-height:
-            min(
-              70dvh,
-              560px
-            );
-        }
-
-        .a11y-row {
-          gap: 8px;
-        }
-
-        .a11y-row button {
-          flex: 0 0 auto;
-        }
-      }
-    `;
-
-    document.head.appendChild(style);
-  }
-
-  // ============================================================
-  // UI
-  // ============================================================
-
-  createUI() {
-
-    // Botão principal
-    this.button = document.createElement("button");
-
-    this.button.id = "a11y-mvp-button";
-
-    this.button.type = "button";
-
-    this.button.setAttribute(
-      "aria-label",
-      "Abrir acessibilidade"
-    );
-
-    this.button.setAttribute(
-      "aria-expanded",
-      "false"
-    );
-
-    this.button.textContent = "♿";
-
-
-    // Painel
-    this.panel = document.createElement("div");
-
-    this.panel.id = "a11y-mvp-panel";
-
-    this.panel.setAttribute(
-      "role",
-      "dialog"
-    );
-
-    this.panel.setAttribute(
-      "aria-label",
-      "Recursos de acessibilidade"
-    );
-
-
-    this.panel.innerHTML = `
-
-      <h2>Acessibilidade</h2>
-
-      <div class="a11y-row">
-
-        <div>
-          <strong>Navegação por olhos</strong><br>
-
-          <small>
-            Use a câmera para controlar o cursor
-            com o olhar.
-          </small>
-        </div>
-
-        <button
-          id="a11y-eye-toggle"
-          type="button"
-        >
-          Ativar
-        </button>
-
-      </div>
-
-
-      <div class="a11y-row">
-
-        <div>
-          <strong>Calibração ocular</strong><br>
-
-          <small>
-            Faça antes de usar a navegação pelos olhos.
-          </small>
-        </div>
-
-        <button
-          id="a11y-calibrate"
-          type="button"
-          disabled
-        >
-          Calibrar
-        </button>
-
-      </div>
-
-
-      <div class="a11y-row">
-
-        <div>
-          <strong>Navegação por voz</strong><br>
-
-          <small>
-            Exemplo:
-            "clicar em Comprar"
-          </small>
-        </div>
-
-        <button
-          id="a11y-voice-toggle"
-          type="button"
-        >
-          Ativar
-        </button>
-
-      </div>
-
-
-      <div class="a11y-row">
-
-        <div>
-          <strong>Comandos disponíveis</strong><br>
-
-          <small>
-            clicar em Comprar<br>
-            preencher nome com Lucas<br>
-            rolar para baixo<br>
-            rolar para cima<br>
-            voltar<br>
-            ir para o topo
-          </small>
-        </div>
-
-      </div>
-
-
-      <div
-        id="a11y-status"
-        role="status"
-        aria-live="polite"
-      >
-        Status: pronto
-      </div>
-    `;
-
-
-    // Cursor ocular
-    this.cursor = document.createElement("div");
-
-    this.cursor.id = "a11y-eye-cursor";
-
-
-    // Preview da câmera
-    this.preview = document.createElement("video");
-
-    this.preview.id = "a11y-eye-preview";
-
-    this.preview.autoplay = true;
-
-    this.preview.muted = true;
-
-    this.preview.playsInline = true;
-
-
-    // Tela de calibração
-    this.createCalibrationUI();
-
-
-    document.body.append(
-      this.button,
-      this.panel,
-      this.cursor,
-      this.preview
-    );
-  }
-
-  // ============================================================
-  // UI DA CALIBRAÇÃO
-  // ============================================================
-
-  createCalibrationUI() {
-
-    this.calibrationOverlay =
-      document.createElement("div");
-
-    this.calibrationOverlay.id =
-      "a11y-calibration";
-
-    this.calibrationOverlay.innerHTML = `
-
-      <div id="a11y-calibration-instruction">
-        Olhe diretamente para o ponto azul.
-      </div>
-
-      <div id="a11y-calibration-dot"></div>
-
-      <div id="a11y-calibration-progress">
-        Preparando calibração...
-      </div>
-
-      <button
-        id="a11y-calibration-cancel"
-        type="button"
-      >
-        Cancelar
-      </button>
-    `;
-
-    document.body.appendChild(
-      this.calibrationOverlay
-    );
-
-    this.calibrationDot =
-      this.calibrationOverlay.querySelector(
-        "#a11y-calibration-dot"
-      );
-
-    this.calibrationInstruction =
-      this.calibrationOverlay.querySelector(
-        "#a11y-calibration-instruction"
-      );
-
-    this.calibrationProgress =
-      this.calibrationOverlay.querySelector(
-        "#a11y-calibration-progress"
-      );
-
-    const cancelButton =
-      this.calibrationOverlay.querySelector(
-        "#a11y-calibration-cancel"
-      );
-
-    cancelButton.addEventListener(
-      "click",
-      () => this.cancelCalibration()
-    );
-  }
-
-  // ============================================================
-  // EVENTOS DA UI
-  // ============================================================
-
-  bindUI() {
-
-    this.button.addEventListener(
-      "click",
-      () => {
-
-        const isOpen =
-          this.panel.classList.toggle("open");
-
-        this.button.setAttribute(
-          "aria-expanded",
-          String(isOpen)
-        );
-      }
-    );
-
-
-    this.panel
-      .querySelector("#a11y-eye-toggle")
-      .addEventListener(
-        "click",
-        () => this.toggleEyes()
-      );
-
-
-    this.panel
-      .querySelector("#a11y-calibrate")
-      .addEventListener(
-        "click",
-        () => this.startCalibration()
-      );
-
-
-    this.panel
-      .querySelector("#a11y-voice-toggle")
-      .addEventListener(
-        "click",
-        () => this.toggleVoice()
-      );
-
-
-    window.addEventListener(
-      "resize",
-      () => {
-
-        this.cursorPosition.x =
-          Math.min(
-            this.cursorPosition.x,
-            window.innerWidth - this.options.screenMargin
-          );
-
-        this.cursorPosition.y =
-          Math.min(
-            this.cursorPosition.y,
-            window.innerHeight - this.options.screenMargin
-          );
-
-        this.updateCursor();
-      }
-    );
-  }
-
-  // ============================================================
-  // STATUS
-  // ============================================================
-
-  setStatus(message) {
-
-    const el =
-      this.panel?.querySelector(
-        "#a11y-status"
-      );
-
-    if (el) {
-      el.textContent =
-        "Status: " + message;
-    }
-  }
-
-  // ============================================================
-  // CURSOR
-  // ============================================================
-
-  updateCursor() {
-
-    if (!this.cursor) {
-      return;
-    }
-
-    this.cursor.style.left =
-      `${this.cursorPosition.x}px`;
-
-    this.cursor.style.top =
-      `${this.cursorPosition.y}px`;
-  }
-
-  // ============================================================
-  // NAVEGAÇÃO OCULAR
-  // ============================================================
-
-  async toggleEyes() {
-
-    if (this.eyeEnabled) {
-
-      this.stopEyes();
-
-      return;
+        this.init();
     }
 
 
-    if (
-      !navigator.mediaDevices ||
-      !navigator.mediaDevices.getUserMedia
-    ) {
+    // ==============================================================
+    // INIT
+    // ==============================================================
 
-      this.setStatus(
-        "este navegador não permite acesso à câmera"
-      );
+    init() {
 
-      return;
+        this.injectStyles();
+
+        this.createUI();
+
+        this.createCursor();
+
+        this.setupKeyboard();
+
+        this.setupResize();
+
+        this.refreshInteractiveElements();
+
+        this.observeDOM();
     }
 
 
-    if (!window.isSecureContext) {
-
-      this.setStatus(
-        "a câmera exige HTTPS ou localhost"
-      );
-
-      return;
-    }
-
-
-    try {
-
-      this.setStatus(
-        "solicitando permissão da câmera..."
-      );
-
-
-      this.stream =
-        await navigator.mediaDevices.getUserMedia({
-
-          video: {
-
-            facingMode: {
-              ideal: "user"
-            },
-
-            width: {
-              ideal: 640
-            },
-
-            height: {
-              ideal: 480
-            },
-
-            frameRate: {
-              ideal: 30,
-              max: 30
-            }
-          },
-
-          audio: false
-        });
-
-
-      this.preview.srcObject =
-        this.stream;
-
-      this.preview.style.display =
-        "block";
-
-
-      await this.preview.play();
-
-
-      this.setStatus(
-        "carregando rastreamento facial..."
-      );
-
-
-      // ========================================================
-      // MEDIA PIPE
-      // ========================================================
-
-      const vision =
-        await import(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14"
-        );
-
-
-      const fileset =
-        await vision.FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-
-
-      this.faceLandmarker =
-        await vision.FaceLandmarker.createFromOptions(
-          fileset,
-          {
-
-            baseOptions: {
-
-              modelAssetPath:
-                "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-            },
-
-            runningMode: "VIDEO",
-
-            numFaces: 1,
-
-            minFaceDetectionConfidence: 0.5,
-
-            minFacePresenceConfidence: 0.5,
-
-            minTrackingConfidence: 0.5
-          }
-        );
-
-
-      this.eyeEnabled = true;
-
-
-      this.eye.gazeX = null;
-      this.eye.gazeY = null;
-
-      this.eye.rawX = null;
-      this.eye.rawY = null;
-
-
-      this.cursor.style.display =
-        "block";
-
-
-      const toggle =
-        this.panel.querySelector(
-          "#a11y-eye-toggle"
-        );
-
-      toggle.textContent =
-        "Desativar";
-
-
-      const calibrationButton =
-        this.panel.querySelector(
-          "#a11y-calibrate"
-        );
-
-      calibrationButton.disabled =
-        false;
-
-
-      this.setStatus(
-        this.calibration.calibrated
-          ? "rastreamento ativo"
-          : "rastreamento ativo — faça a calibração"
-      );
-
-
-      this.startEyeTracking();
-
-    } catch (error) {
-
-      console.error(
-        "Erro ao iniciar olhos:",
-        error
-      );
-
-
-      this.stopEyes();
-
-
-      if (
-        error.name ===
-        "NotAllowedError"
-      ) {
-
-        this.setStatus(
-          "permissão da câmera negada"
-        );
-
-      } else if (
-        error.name ===
-        "NotFoundError"
-      ) {
-
-        this.setStatus(
-          "nenhuma câmera encontrada"
-        );
-
-      } else {
-
-        this.setStatus(
-          "falha ao iniciar câmera/rastreamento — verifique HTTPS e conexão"
-        );
-      }
-    }
-  }
-
-  // ============================================================
-  // PARAR OLHOS
-  // ============================================================
-
-  stopEyes() {
-
-    this.eyeEnabled = false;
-
-
-    if (
-      this.eyeLoopId !== null
-    ) {
-
-      cancelAnimationFrame(
-        this.eyeLoopId
-      );
-
-      this.eyeLoopId = null;
-    }
-
-
-    if (this.faceLandmarker) {
-
-      try {
-        this.faceLandmarker.close();
-      } catch (e) {
-        console.warn(e);
-      }
-
-      this.faceLandmarker = null;
-    }
-
-
-    if (this.stream) {
-
-      this.stream
-        .getTracks()
-        .forEach(
-          track => track.stop()
-        );
-
-      this.stream = null;
-    }
-
-
-    if (this.preview) {
-
-      this.preview.srcObject =
-        null;
-
-      this.preview.style.display =
-        "none";
-    }
-
-
-    if (this.cursor) {
-
-      this.cursor.style.display =
-        "none";
-    }
-
-
-    this.eye.dwellTarget =
-      null;
-
-    this.eye.dwellLockedTarget =
-      null;
-
-
-    const eyeButton =
-      this.panel?.querySelector(
-        "#a11y-eye-toggle"
-      );
-
-    if (eyeButton) {
-      eyeButton.textContent =
-        "Ativar";
-    }
-
-
-    const calibrationButton =
-      this.panel?.querySelector(
-        "#a11y-calibrate"
-      );
-
-    if (calibrationButton) {
-      calibrationButton.disabled =
-        true;
-    }
-
-
-    this.setStatus(
-      "navegação por olhos desativada"
-    );
-  }
-
-  // ============================================================
-  // LOOP DOS OLHOS
-  // ============================================================
-
-  startEyeTracking() {
-
-    let lastDetection = 0;
-
-
-    const track = (now) => {
-
-      if (
-        !this.eyeEnabled ||
-        !this.faceLandmarker
-      ) {
-
-        return;
-      }
-
-
-      this.eyeLoopId =
-        requestAnimationFrame(track);
-
-
-      // aproximadamente 30 FPS
-      if (
-        now - lastDetection < 33
-      ) {
-
-        return;
-      }
-
-
-      lastDetection = now;
-
-
-      if (
-        this.preview.readyState < 2
-      ) {
-
-        return;
-      }
-
-
-      let result;
-
-      try {
-
-        result =
-          this.faceLandmarker.detectForVideo(
-            this.preview,
-            now
-          );
-
-      } catch (error) {
-
-        console.warn(
-          "Erro detectForVideo:",
-          error
-        );
-
-        return;
-      }
-
-
-      const landmarks =
-        result.faceLandmarks?.[0];
-
-
-      if (
-        !landmarks ||
-        landmarks.length < 478
-      ) {
+    // ==============================================================
+    // CSS
+    // ==============================================================
+
+    injectStyles() {
 
         if (
-          now -
-          this.eye.lastFaceStatus >
-          2000
+            document.getElementById(
+                "a11y-head-styles"
+            )
         ) {
 
-          this.setStatus(
-            "rosto não detectado — centralize o rosto na câmera"
-          );
-
-          this.eye.lastFaceStatus =
-            now;
+            return;
         }
 
 
-        this.eye.dwellTarget =
-          null;
+        const style =
+            document.createElement("style");
 
 
-        this.cursor.style.width =
-          `${this.options.cursorSize}px`;
-
-        this.cursor.style.height =
-          `${this.options.cursorSize}px`;
+        style.id =
+            "a11y-head-styles";
 
 
-        return;
-      }
+        style.textContent = `
+
+            /* =====================================================
+               PAINEL
+               ===================================================== */
+
+            #a11y-head-panel {
+
+                position: fixed;
+
+                right: 20px;
+
+                bottom: 20px;
+
+                width: 330px;
+
+                padding: 18px;
+
+                background: #111827;
+
+                color: white;
+
+                border-radius: 16px;
+
+                box-shadow:
+                    0 15px 50px
+                    rgba(0,0,0,.45);
+
+                z-index: 2147483647;
+
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "Segoe UI",
+                    sans-serif;
+
+                font-size: 14px;
+
+                box-sizing: border-box;
+            }
 
 
-      const gaze =
-        this.getGazePosition(
-          landmarks
-        );
+            #a11y-head-panel h3 {
+
+                margin:
+                    0 0 12px;
+
+                font-size: 18px;
+
+            }
 
 
-      if (!gaze) {
-        return;
-      }
+            #a11y-head-status {
+
+                padding: 10px;
+
+                margin-bottom: 10px;
+
+                background: #1f2937;
+
+                border-radius: 9px;
+
+                line-height: 1.5;
+
+            }
 
 
-      this.eye.rawX =
-        gaze.x;
+            .a11y-head-button {
 
-      this.eye.rawY =
-        gaze.y;
+                width: 100%;
 
+                min-height: 42px;
 
-      // ========================================================
-      // CALIBRAÇÃO
-      // ========================================================
+                padding: 10px;
 
-      if (
-        this.eye.calibration.active
-      ) {
+                margin-top: 8px;
 
-        this.collectCalibrationSample(
-          gaze.x,
-          gaze.y
-        );
+                border: none;
 
-        return;
-      }
+                border-radius: 10px;
 
+                background: #2563eb;
 
-      // ========================================================
-      // SUAVIZAÇÃO
-      // ========================================================
+                color: white;
 
-      if (
-        this.eye.gazeX === null
-      ) {
+                cursor: pointer;
 
-        this.eye.gazeX =
-          gaze.x;
+                font-size: 14px;
 
-        this.eye.gazeY =
-          gaze.y;
+                font-weight: 600;
 
-      } else {
-
-        this.eye.gazeX +=
-          (
-            gaze.x -
-            this.eye.gazeX
-          ) *
-          this.options.smoothing;
+            }
 
 
-        this.eye.gazeY +=
-          (
-            gaze.y -
-            this.eye.gazeY
-          ) *
-          this.options.smoothing;
-      }
+            .a11y-head-button:hover {
+
+                background: #1d4ed8;
+
+            }
 
 
-      // ========================================================
-      // CURSOR
-      // ========================================================
+            .a11y-head-button.secondary {
 
-      this.updateEyePosition(
-        this.eye.gazeX,
-        this.eye.gazeY
-      );
+                background: #374151;
+
+            }
 
 
-      // ========================================================
-      // DWELL CLICK
-      // ========================================================
+            .a11y-head-button:disabled {
 
-      this.updateDwellClick(
-        now
-      );
-    };
+                opacity: .45;
 
+                cursor: not-allowed;
 
-    this.eyeLoopId =
-      requestAnimationFrame(track);
-  }
-
-  // ============================================================
-  // CALCULAR POSIÇÃO DO OLHAR
-  // ============================================================
-
-  getGazePosition(landmarks) {
-
-    const eyes = [
-
-      {
-        iris: 468,
-
-        corners: [
-          33,
-          133
-        ],
-
-        lids: [
-          159,
-          145
-        ]
-      },
-
-      {
-        iris: 473,
-
-        corners: [
-          362,
-          263
-        ],
-
-        lids: [
-          386,
-          374
-        ]
-      }
-
-    ];
+            }
 
 
-    const positions =
-      eyes.map(
-        ({
-          iris,
-          corners,
-          lids
-        }) => {
+            /* =====================================================
+               CURSOR
+               ===================================================== */
 
-          const irisPoint =
-            landmarks[iris];
+            #a11y-head-cursor {
+
+                position: fixed;
+
+                left: 0;
+
+                top: 0;
+
+                width: 34px;
+
+                height: 34px;
+
+                border-radius: 50%;
+
+                background:
+                    rgba(0, 229, 255, .96);
+
+                border:
+                    4px solid white;
+
+                box-shadow:
+                    0 0 0 3px
+                    rgba(0,229,255,.35),
+
+                    0 0 22px
+                    rgba(0,229,255,.9);
+
+                pointer-events: none;
+
+                z-index: 2147483646;
+
+                transform:
+                    translate(-50%, -50%);
+
+                box-sizing: border-box;
+
+                transition:
+                    width .1s ease,
+                    height .1s ease,
+                    background .1s ease;
+
+            }
 
 
-          const cornerPoints =
-            corners.map(
-              index =>
-                landmarks[index]
+            #a11y-head-cursor.clickable {
+
+                width: 44px;
+
+                height: 44px;
+
+                background:
+                    rgba(34,197,94,.96);
+
+                box-shadow:
+                    0 0 0 4px
+                    rgba(34,197,94,.25),
+
+                    0 0 25px
+                    rgba(34,197,94,.9);
+
+            }
+
+
+            #a11y-head-cursor.clicking {
+
+                width: 52px;
+
+                height: 52px;
+
+                background:
+                    rgba(250,204,21,.98);
+
+            }
+
+
+            /* =====================================================
+               DWELL
+               ===================================================== */
+
+            #a11y-head-dwell {
+
+                position: fixed;
+
+                width: 62px;
+
+                height: 62px;
+
+                border-radius: 50%;
+
+                border:
+                    4px solid
+                    rgba(255,255,255,.85);
+
+                pointer-events: none;
+
+                z-index: 2147483645;
+
+                transform:
+                    translate(-50%, -50%);
+
+                display: none;
+
+                box-sizing: border-box;
+
+            }
+
+
+            #a11y-head-dwell-progress {
+
+                position: absolute;
+
+                inset: -4px;
+
+                border-radius: 50%;
+
+                border:
+                    4px solid transparent;
+
+                border-top-color:
+                    #22c55e;
+
+                transform:
+                    rotate(-90deg);
+
+            }
+
+
+            /* =====================================================
+               CAMERA
+               ===================================================== */
+
+            #a11y-head-camera {
+
+                position: fixed;
+
+                left: 20px;
+
+                bottom: 20px;
+
+                width: 220px;
+
+                aspect-ratio: 16 / 9;
+
+                background: black;
+
+                border-radius: 14px;
+
+                overflow: hidden;
+
+                z-index: 2147483644;
+
+                box-shadow:
+                    0 10px 35px
+                    rgba(0,0,0,.4);
+
+                display: none;
+
+            }
+
+
+            #a11y-head-camera video {
+
+                width: 100%;
+
+                height: 100%;
+
+                object-fit: cover;
+
+                transform:
+                    scaleX(-1);
+
+            }
+
+
+            #a11y-head-camera-label {
+
+                position: absolute;
+
+                top: 8px;
+
+                left: 8px;
+
+                padding: 4px 8px;
+
+                background:
+                    rgba(0,0,0,.7);
+
+                color: white;
+
+                border-radius: 6px;
+
+                font-size: 11px;
+
+            }
+
+
+            /* =====================================================
+               CALIBRAÇÃO
+               ===================================================== */
+
+            #a11y-head-calibration {
+
+                position: fixed;
+
+                inset: 0;
+
+                z-index: 2147483647;
+
+                background:
+                    rgba(0,0,0,.94);
+
+                color: white;
+
+                display: none;
+
+                align-items: center;
+
+                justify-content: center;
+
+                flex-direction: column;
+
+                text-align: center;
+
+                font-family:
+                    system-ui,
+                    sans-serif;
+
+                padding: 20px;
+
+                box-sizing: border-box;
+
+            }
+
+
+            #a11y-head-calibration h2 {
+
+                margin:
+                    0 0 14px;
+
+                font-size: 30px;
+
+            }
+
+
+            #a11y-calibration-dot {
+
+                width: 42px;
+
+                height: 42px;
+
+                border-radius: 50%;
+
+                background: #00e5ff;
+
+                box-shadow:
+                    0 0 30px
+                    rgba(0,229,255,.9);
+
+                position: fixed;
+
+                transform:
+                    translate(-50%, -50%);
+
+                transition:
+                    left .3s ease,
+                    top .3s ease;
+
+            }
+
+
+            #a11y-calibration-progress {
+
+                width: 320px;
+
+                max-width: 80vw;
+
+                height: 8px;
+
+                margin-top: 25px;
+
+                background: #374151;
+
+                border-radius: 20px;
+
+                overflow: hidden;
+
+            }
+
+
+            #a11y-head-calibration-bar {
+
+                width: 0%;
+
+                height: 100%;
+
+                background: #00e5ff;
+
+            }
+
+
+            #a11y-calibration-message {
+
+                max-width: 600px;
+
+                line-height: 1.6;
+
+                font-size: 17px;
+
+            }
+
+
+            /* =====================================================
+               DEBUG
+               ===================================================== */
+
+            #a11y-head-debug {
+
+                position: fixed;
+
+                top: 10px;
+
+                left: 10px;
+
+                padding: 8px 10px;
+
+                border-radius: 8px;
+
+                background:
+                    rgba(0,0,0,.7);
+
+                color: white;
+
+                font-family:
+                    monospace;
+
+                font-size: 11px;
+
+                z-index: 2147483640;
+
+                pointer-events: none;
+
+                display: none;
+
+            }
+
+
+            @media (max-width: 600px) {
+
+                #a11y-head-panel {
+
+                    left: 10px;
+
+                    right: 10px;
+
+                    bottom: 10px;
+
+                    width: auto;
+
+                }
+
+
+                #a11y-head-camera {
+
+                    left: 10px;
+
+                    top: 10px;
+
+                    bottom: auto;
+
+                    width: 150px;
+
+                }
+
+            }
+
+        `;
+
+
+        document.head.appendChild(style);
+    }
+
+
+    // ==============================================================
+    // UI
+    // ==============================================================
+
+    createUI() {
+
+        if (this.options.showPanel) {
+
+            this.panel =
+                document.createElement("div");
+
+
+            this.panel.id =
+                "a11y-head-panel";
+
+
+            this.panel.innerHTML = `
+
+                <h3>
+                    🧠 Cursor por movimento da cabeça
+                </h3>
+
+                <div id="a11y-head-status">
+                    Câmera desativada
+                </div>
+
+                <button
+                    id="a11y-head-start"
+                    class="a11y-head-button"
+                >
+                    Ativar câmera
+                </button>
+
+                <button
+                    id="a11y-head-calibrate"
+                    class="a11y-head-button secondary"
+                    disabled
+                >
+                    Calibrar cabeça
+                </button>
+
+                <button
+                    id="a11y-head-dwell"
+                    class="a11y-head-button secondary"
+                >
+                    Dwell: ON
+                </button>
+
+                <button
+                    id="a11y-head-camera-toggle"
+                    class="a11y-head-button secondary"
+                >
+                    Câmera: ON
+                </button>
+
+                <div
+                    style="
+                        margin-top:12px;
+                        font-size:12px;
+                        opacity:.78;
+                        line-height:1.55;
+                    "
+                >
+
+                    <strong>Como usar:</strong><br>
+
+                    Mova a cabeça para controlar
+                    o cursor.<br><br>
+
+                    🎯 Faça a calibração antes
+                    de começar.<br>
+
+                    👇 Acene para baixo e volte
+                    para clicar.<br>
+
+                    ⏱️ Ou permaneça sobre um
+                    botão para usar o Dwell.
+
+                </div>
+            `;
+
+
+            document.body.appendChild(
+                this.panel
             );
 
 
-          const lidPoints =
-            lids.map(
-              index =>
-                landmarks[index]
+            this.statusElement =
+                this.panel.querySelector(
+                    "#a11y-head-status"
+                );
+
+
+            this.panel
+                .querySelector(
+                    "#a11y-head-start"
+                )
+                .addEventListener(
+                    "click",
+                    () =>
+                        this.toggleCamera()
+                );
+
+
+            this.panel
+                .querySelector(
+                    "#a11y-head-calibrate"
+                )
+                .addEventListener(
+                    "click",
+                    () =>
+                        this.startCalibration()
+                );
+
+
+            this.panel
+                .querySelector(
+                    "#a11y-head-dwell"
+                )
+                .addEventListener(
+                    "click",
+                    event => {
+
+                        this.options.dwellEnabled =
+                            !this.options.dwellEnabled;
+
+                        event.currentTarget
+                            .textContent =
+                            this.options.dwellEnabled
+                                ? "Dwell: ON"
+                                : "Dwell: OFF";
+
+                        this.resetDwell();
+                    }
+                );
+
+
+            this.panel
+                .querySelector(
+                    "#a11y-head-camera-toggle"
+                )
+                .addEventListener(
+                    "click",
+                    event => {
+
+                        this.options.showCameraPreview =
+                            !this.options.showCameraPreview;
+
+                        this.updateCameraVisibility();
+
+                        event.currentTarget
+                            .textContent =
+                            this.options.showCameraPreview
+                                ? "Câmera: ON"
+                                : "Câmera: OFF";
+                    }
+                );
+        }
+
+
+        // ==========================================================
+        // DWELL
+        // ==========================================================
+
+        this.dwellElement =
+            document.createElement("div");
+
+        this.dwellElement.id =
+            "a11y-head-dwell";
+
+        this.dwellElement.innerHTML = `
+
+            <div
+                id="a11y-head-dwell-progress"
+            ></div>
+
+        `;
+
+        document.body.appendChild(
+            this.dwellElement
+        );
+
+
+        // ==========================================================
+        // CAMERA
+        // ==========================================================
+
+        this.cameraContainer =
+            document.createElement("div");
+
+        this.cameraContainer.id =
+            "a11y-head-camera";
+
+        this.cameraContainer.innerHTML = `
+
+            <video
+                id="a11y-head-video"
+                autoplay
+                muted
+                playsinline
+            ></video>
+
+            <div id="a11y-head-camera-label">
+                Detecção da cabeça
+            </div>
+
+        `;
+
+        document.body.appendChild(
+            this.cameraContainer
+        );
+
+
+        this.video =
+            this.cameraContainer.querySelector(
+                "#a11y-head-video"
             );
 
 
-          if (
-            !irisPoint ||
-            cornerPoints.some(
-              p => !p
-            ) ||
-            lidPoints.some(
-              p => !p
-            )
-          ) {
+        // ==========================================================
+        // CALIBRAÇÃO
+        // ==========================================================
+
+        this.calibrationOverlay =
+            document.createElement("div");
+
+        this.calibrationOverlay.id =
+            "a11y-head-calibration";
+
+        this.calibrationOverlay.innerHTML = `
+
+            <div
+                id="a11y-calibration-dot"
+            ></div>
+
+            <h2>
+                Calibração
+            </h2>
+
+            <div
+                id="a11y-calibration-message"
+            >
+                Prepare-se...
+            </div>
+
+            <div
+                id="a11y-calibration-progress"
+            >
+                <div
+                    id="a11y-head-calibration-bar"
+                ></div>
+            </div>
+
+        `;
+
+        document.body.appendChild(
+            this.calibrationOverlay
+        );
+
+
+        // ==========================================================
+        // DEBUG
+        // ==========================================================
+
+        this.debugElement =
+            document.createElement("div");
+
+        this.debugElement.id =
+            "a11y-head-debug";
+
+        document.body.appendChild(
+            this.debugElement
+        );
+    }
+
+
+    // ==============================================================
+    // CURSOR
+    // ==============================================================
+
+    createCursor() {
+
+        this.cursorElement =
+            document.createElement("div");
+
+        this.cursorElement.id =
+            "a11y-head-cursor";
+
+        document.body.appendChild(
+            this.cursorElement
+        );
+
+        this.updateCursorPosition();
+    }
+
+
+    // ==============================================================
+    // CAMERA
+    // ==============================================================
+
+    async toggleCamera() {
+
+        if (this.cameraEnabled) {
+
+            this.stopCamera();
+
+        } else {
+
+            await this.startCamera();
+        }
+    }
+
+
+    // ==============================================================
+    // START CAMERA
+    // ==============================================================
+
+    async startCamera() {
+
+        try {
+
+            if (
+                !window.isSecureContext &&
+                location.hostname !== "localhost"
+            ) {
+
+                throw new Error(
+                    "A câmera exige HTTPS ou localhost."
+                );
+            }
+
+
+            if (
+                !navigator.mediaDevices ||
+                !navigator.mediaDevices.getUserMedia
+            ) {
+
+                throw new Error(
+                    "Este navegador não suporta acesso à câmera."
+                );
+            }
+
+
+            this.updateStatus(
+                "Solicitando acesso à câmera..."
+            );
+
+
+            this.stream =
+                await navigator.mediaDevices
+                    .getUserMedia({
+
+                        video: {
+
+                            facingMode: {
+                                ideal: "user"
+                            },
+
+                            width: {
+                                ideal: 640
+                            },
+
+                            height: {
+                                ideal: 480
+                            },
+
+                            frameRate: {
+                                ideal: 30
+                            }
+                        },
+
+                        audio: false
+                    });
+
+
+            this.video.srcObject =
+                this.stream;
+
+
+            await this.video.play();
+
+
+            this.updateStatus(
+                "Carregando detector facial..."
+            );
+
+
+            // ======================================================
+            // MEDIAPIPE
+            // ======================================================
+
+            const vision =
+                await import(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304"
+                );
+
+
+            const FilesetResolver =
+                vision.FilesetResolver;
+
+
+            const FaceLandmarker =
+                vision.FaceLandmarker;
+
+
+            const resolver =
+                await FilesetResolver.forVisionTasks(
+
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
+
+                );
+
+
+            this.faceLandmarker =
+                await FaceLandmarker.createFromOptions(
+                    resolver,
+                    {
+
+                        baseOptions: {
+
+                            modelAssetPath:
+                                "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+
+                            delegate:
+                                "GPU"
+                        },
+
+                        runningMode:
+                            "VIDEO",
+
+                        numFaces:
+                            1,
+
+                        minFaceDetectionConfidence:
+                            0.5,
+
+                        minFacePresenceConfidence:
+                            0.5,
+
+                        minTrackingConfidence:
+                            0.5,
+
+                        outputFaceBlendshapes:
+                            false,
+
+                        outputFacialTransformationMatrixes:
+                            true
+                    }
+                );
+
+
+            this.cameraEnabled =
+                true;
+
+
+            this.updateCameraVisibility();
+
+
+            const startButton =
+                this.panel?.querySelector(
+                    "#a11y-head-start"
+                );
+
+
+            const calibrateButton =
+                this.panel?.querySelector(
+                    "#a11y-head-calibrate"
+                );
+
+
+            if (startButton) {
+
+                startButton.textContent =
+                    "Desativar câmera";
+            }
+
+
+            if (calibrateButton) {
+
+                calibrateButton.disabled =
+                    false;
+            }
+
+
+            this.updateStatus(
+                "Câmera ativa."
+            );
+
+
+            // ======================================================
+            // INICIA DETECÇÃO
+            // ======================================================
+
+            this.processVideo();
+
+
+            // ======================================================
+            // INICIA CURSOR
+            // ======================================================
+
+            this.startCursorLoop();
+
+
+            // ======================================================
+            // CALIBRAÇÃO AUTOMÁTICA
+            // ======================================================
+
+            await this.startCalibration();
+
+        } catch (error) {
+
+            console.error(
+                "Erro ao iniciar câmera:",
+                error
+            );
+
+
+            this.updateStatus(
+                this.getErrorMessage(error)
+            );
+
+
+            this.stopCamera();
+        }
+    }
+
+
+    // ==============================================================
+    // STOP CAMERA
+    // ==============================================================
+
+    stopCamera() {
+
+        this.cameraEnabled =
+            false;
+
+
+        if (this.videoAnimationFrame) {
+
+            cancelAnimationFrame(
+                this.videoAnimationFrame
+            );
+
+            this.videoAnimationFrame =
+                null;
+        }
+
+
+        if (this.cursorAnimationFrame) {
+
+            cancelAnimationFrame(
+                this.cursorAnimationFrame
+            );
+
+            this.cursorAnimationFrame =
+                null;
+        }
+
+
+        if (this.stream) {
+
+            this.stream
+                .getTracks()
+                .forEach(
+                    track =>
+                        track.stop()
+                );
+
+            this.stream =
+                null;
+        }
+
+
+        if (this.video) {
+
+            this.video.srcObject =
+                null;
+        }
+
+
+        if (this.faceLandmarker) {
+
+            try {
+
+                this.faceLandmarker.close();
+
+            } catch (error) {
+
+                console.warn(
+                    error
+                );
+            }
+
+            this.faceLandmarker =
+                null;
+        }
+
+
+        this.isCalibrated =
+            false;
+
+        this.calibrationRunning =
+            false;
+
+
+        this.resetDwell();
+
+
+        this.cursorVelocityX =
+            0;
+
+        this.cursorVelocityY =
+            0;
+
+
+        this.updateCameraVisibility();
+
+
+        const startButton =
+            this.panel?.querySelector(
+                "#a11y-head-start"
+            );
+
+
+        const calibrateButton =
+            this.panel?.querySelector(
+                "#a11y-head-calibrate"
+            );
+
+
+        if (startButton) {
+
+            startButton.textContent =
+                "Ativar câmera";
+        }
+
+
+        if (calibrateButton) {
+
+            calibrateButton.disabled =
+                true;
+        }
+
+
+        this.updateStatus(
+            "Câmera desativada"
+        );
+    }
+
+
+    // ==============================================================
+    // CAMERA VISIBILITY
+    // ==============================================================
+
+    updateCameraVisibility() {
+
+        if (!this.cameraContainer) {
+
+            return;
+        }
+
+
+        this.cameraContainer.style.display =
+            this.cameraEnabled &&
+            this.options.showCameraPreview
+                ? "block"
+                : "none";
+    }
+
+
+    // ==============================================================
+    // PROCESS VIDEO
+    // ==============================================================
+
+    processVideo() {
+
+        if (
+            !this.cameraEnabled ||
+            !this.faceLandmarker
+        ) {
+
+            return;
+        }
+
+
+        const now =
+            performance.now();
+
+
+        if (
+            this.video.readyState >= 2 &&
+            this.video.currentTime !==
+                this.lastVideoTime
+        ) {
+
+            this.lastVideoTime =
+                this.video.currentTime;
+
+
+            try {
+
+                const result =
+                    this.faceLandmarker
+                        .detectForVideo(
+                            this.video,
+                            now
+                        );
+
+
+                this.processFaceResult(
+                    result
+                );
+
+            } catch (error) {
+
+                console.error(
+                    "Erro detectando rosto:",
+                    error
+                );
+            }
+        }
+
+
+        this.videoAnimationFrame =
+            requestAnimationFrame(
+                () =>
+                    this.processVideo()
+            );
+    }
+
+
+    // ==============================================================
+    // PROCESS FACE
+    // ==============================================================
+
+    processFaceResult(result) {
+
+        if (
+            !result ||
+            !result.faceLandmarks ||
+            result.faceLandmarks.length === 0
+        ) {
+
+            this.cursorVelocityX = 0;
+
+            this.cursorVelocityY = 0;
+
+            this.updateStatus(
+                "Rosto não detectado"
+            );
+
+            return;
+        }
+
+
+        const landmarks =
+            result.faceLandmarks[0];
+
+
+        const pose =
+            this.calculateHeadPose(
+                landmarks
+            );
+
+
+        if (!pose) {
+
+            return;
+        }
+
+
+        this.currentYaw =
+            pose.yaw;
+
+        this.currentPitch =
+            pose.pitch;
+
+
+        // ==========================================================
+        // FILTRO
+        // ==========================================================
+
+        const alpha =
+            this.options.smoothing;
+
+
+        this.filteredYaw +=
+            (
+                this.currentYaw -
+                this.filteredYaw
+            ) * alpha;
+
+
+        this.filteredPitch +=
+            (
+                this.currentPitch -
+                this.filteredPitch
+            ) * alpha;
+
+
+        // ==========================================================
+        // SE ESTIVER CALIBRANDO
+        // ==========================================================
+
+        if (
+            this.calibrationRunning
+        ) {
+
+            this.collectCalibrationSample();
+
+            return;
+        }
+
+
+        // ==========================================================
+        // SE NÃO CALIBRADO
+        // ==========================================================
+
+        if (
+            !this.isCalibrated
+        ) {
+
+            return;
+        }
+
+
+        // ==========================================================
+        // MOVIMENTO
+        // ==========================================================
+
+        const yaw =
+            this.filteredYaw -
+            this.calibration.centerYaw;
+
+
+        const pitch =
+            this.filteredPitch -
+            this.calibration.centerPitch;
+
+
+        this.updateHeadVelocity(
+            yaw,
+            pitch
+        );
+
+
+        // ==========================================================
+        // NOD
+        // ==========================================================
+
+        if (
+            this.options.nodEnabled
+        ) {
+
+            this.detectNod(
+                pitch
+            );
+        }
+    }
+
+
+    // ==============================================================
+    // CALCULA POSE
+    // ==============================================================
+
+    calculateHeadPose(
+        landmarks
+    ) {
+
+        const nose =
+            landmarks[1];
+
+        const forehead =
+            landmarks[10];
+
+        const chin =
+            landmarks[152];
+
+        const leftOuter =
+            landmarks[33];
+
+        const leftInner =
+            landmarks[133];
+
+        const rightInner =
+            landmarks[362];
+
+        const rightOuter =
+            landmarks[263];
+
+
+        if (
+            !nose ||
+            !forehead ||
+            !chin ||
+            !leftOuter ||
+            !leftInner ||
+            !rightInner ||
+            !rightOuter
+        ) {
 
             return null;
-          }
-
-
-          const left =
-            Math.min(
-              cornerPoints[0].x,
-              cornerPoints[1].x
-            );
-
-
-          const right =
-            Math.max(
-              cornerPoints[0].x,
-              cornerPoints[1].x
-            );
-
-
-          const top =
-            Math.min(
-              lidPoints[0].y,
-              lidPoints[1].y
-            );
-
-
-          const bottom =
-            Math.max(
-              lidPoints[0].y,
-              lidPoints[1].y
-            );
-
-
-          const eyeWidth =
-            Math.max(
-              right - left,
-              0.001
-            );
-
-
-          const eyeHeight =
-            Math.max(
-              bottom - top,
-              0.001
-            );
-
-
-          let x =
-            (
-              irisPoint.x -
-              left
-            ) /
-            eyeWidth;
-
-
-          let y =
-            (
-              irisPoint.y -
-              top
-            ) /
-            eyeHeight;
-
-
-          /*
-           * Espelhamento horizontal.
-           *
-           * A câmera frontal normalmente é exibida
-           * como espelho, então invertemos X.
-           */
-
-          x = 1 - x;
-
-
-          x =
-            Math.max(
-              0,
-              Math.min(1, x)
-            );
-
-
-          y =
-            Math.max(
-              0,
-              Math.min(1, y)
-            );
-
-
-          return {
-            x,
-            y
-          };
         }
-      );
 
 
-    const valid =
-      positions.filter(Boolean);
+        // ==========================================================
+        // OLHO ESQUERDO
+        // ==========================================================
 
+        const leftEye = {
 
-    if (
-      valid.length === 0
-    ) {
+            x:
+                (
+                    leftOuter.x +
+                    leftInner.x
+                ) / 2,
 
-      return null;
-    }
+            y:
+                (
+                    leftOuter.y +
+                    leftInner.y
+                ) / 2
+        };
 
 
-    return {
+        // ==========================================================
+        // OLHO DIREITO
+        // ==========================================================
 
-      x:
-        valid.reduce(
-          (sum, p) =>
-            sum + p.x,
-          0
-        ) /
-        valid.length,
+        const rightEye = {
 
-      y:
-        valid.reduce(
-          (sum, p) =>
-            sum + p.y,
-          0
-        ) /
-        valid.length
-    };
-  }
+            x:
+                (
+                    rightOuter.x +
+                    rightInner.x
+                ) / 2,
 
-  // ============================================================
-  // POSIÇÃO DO CURSOR
-  // ============================================================
+            y:
+                (
+                    rightOuter.y +
+                    rightInner.y
+                ) / 2
+        };
 
-  updateEyePosition(
-    x,
-    y
-  ) {
 
-    if (!this.eyeEnabled) {
-      return;
-    }
+        // ==========================================================
+        // CENTRO DOS OLHOS
+        // ==========================================================
 
+        const eyeCenter = {
 
-    let normalizedX;
-    let normalizedY;
+            x:
+                (
+                    leftEye.x +
+                    rightEye.x
+                ) / 2,
 
+            y:
+                (
+                    leftEye.y +
+                    rightEye.y
+                ) / 2
+        };
 
-    // ========================================================
-    // COM CALIBRAÇÃO
-    // ========================================================
 
-    if (
-      this.calibration.calibrated
-    ) {
+        // ==========================================================
+        // DISTÂNCIA DOS OLHOS
+        // ==========================================================
 
-      normalizedX =
-        this.mapRange(
-          x,
-          this.calibration.minX,
-          this.calibration.maxX,
-          0,
-          1
-        );
+        const eyeDistance =
+            Math.hypot(
 
+                rightEye.x -
+                leftEye.x,
 
-      normalizedY =
-        this.mapRange(
-          y,
-          this.calibration.minY,
-          this.calibration.maxY,
-          0,
-          1
-        );
+                rightEye.y -
+                leftEye.y
+            );
 
-    } else {
 
-      /*
-       * Antes da calibração usamos uma faixa conservadora.
-       */
-
-      normalizedX =
-        this.mapRange(
-          x,
-          0.15,
-          0.85,
-          0,
-          1
-        );
-
-
-      normalizedY =
-        this.mapRange(
-          y,
-          0.15,
-          0.85,
-          0,
-          1
-        );
-    }
-
-
-    normalizedX =
-      Math.max(
-        0,
-        Math.min(1, normalizedX)
-      );
-
-
-    normalizedY =
-      Math.max(
-        0,
-        Math.min(1, normalizedY)
-      );
-
-
-    const margin =
-      this.options.screenMargin;
-
-
-    const targetX =
-      margin +
-      normalizedX *
-      (
-        window.innerWidth -
-        margin * 2
-      );
-
-
-    const targetY =
-      margin +
-      normalizedY *
-      (
-        window.innerHeight -
-        margin * 2
-      );
-
-
-    // ========================================================
-    // SUAVIZAÇÃO
-    // ========================================================
-
-    this.cursorPosition.x +=
-      (
-        targetX -
-        this.cursorPosition.x
-      ) *
-      this.options.smoothing;
-
-
-    this.cursorPosition.y +=
-      (
-        targetY -
-        this.cursorPosition.y
-      ) *
-      this.options.smoothing;
-
-
-    this.cursorPosition.x =
-      Math.max(
-        margin,
-        Math.min(
-          window.innerWidth - margin,
-          this.cursorPosition.x
-        )
-      );
-
-
-    this.cursorPosition.y =
-      Math.max(
-        margin,
-        Math.min(
-          window.innerHeight - margin,
-          this.cursorPosition.y
-        )
-      );
-
-
-    this.updateCursor();
-  }
-
-  // ============================================================
-  // MAP RANGE
-  // ============================================================
-
-  mapRange(
-    value,
-    inMin,
-    inMax,
-    outMin,
-    outMax
-  ) {
-
-    if (
-      Math.abs(inMax - inMin) <
-      0.0001
-    ) {
-
-      return (
-        outMin +
-        outMax
-      ) / 2;
-    }
-
-
-    return (
-      (
-        value - inMin
-      ) /
-      (
-        inMax - inMin
-      )
-    ) *
-    (
-      outMax - outMin
-    ) +
-    outMin;
-  }
-
-  // ============================================================
-  // DWELL CLICK
-  // ============================================================
-
-  updateDwellClick(now) {
-
-    const element =
-      document.elementFromPoint(
-        this.cursorPosition.x,
-        this.cursorPosition.y
-      );
-
-
-    const target =
-      element?.closest(
-        `
-        button,
-        a,
-        input,
-        select,
-        textarea,
-        [role='button'],
-        label
-        `
-      );
-
-
-    if (!target) {
-
-      this.eye.dwellTarget =
-        null;
-
-      this.eye.dwellLockedTarget =
-        null;
-
-
-      this.cursor.style.width =
-        `${this.options.cursorSize}px`;
-
-      this.cursor.style.height =
-        `${this.options.cursorSize}px`;
-
-
-      return;
-    }
-
-
-    /*
-     * Evita clicar repetidamente no mesmo elemento.
-     */
-
-    if (
-      target !==
-      this.eye.dwellLockedTarget
-    ) {
-
-      this.eye.dwellLockedTarget =
-        null;
-    }
-
-
-    if (
-      target ===
-      this.eye.dwellLockedTarget
-    ) {
-
-      return;
-    }
-
-
-    if (
-      target !==
-      this.eye.dwellTarget
-    ) {
-
-      this.eye.dwellTarget =
-        target;
-
-      this.eye.dwellStartedAt =
-        now;
-
-
-      this.cursor.style.width =
-        `${this.options.cursorSize}px`;
-
-      this.cursor.style.height =
-        `${this.options.cursorSize}px`;
-
-
-      return;
-    }
-
-
-    const progress =
-      Math.min(
-        1,
-        (
-          now -
-          this.eye.dwellStartedAt
-        ) /
-        this.options.dwellTime
-      );
-
-
-    const size =
-      this.options.cursorSize +
-      progress * 12;
-
-
-    this.cursor.style.width =
-      `${size}px`;
-
-    this.cursor.style.height =
-      `${size}px`;
-
-
-    if (
-      progress >= 1
-    ) {
-
-      this.eye.dwellLockedTarget =
-        target;
-
-      this.eye.dwellTarget =
-        null;
-
-
-      this.cursor.style.width =
-        `${this.options.cursorSize}px`;
-
-      this.cursor.style.height =
-        `${this.options.cursorSize}px`;
-
-
-      this.clickElement(
-        target
-      );
-    }
-  }
-
-  // ============================================================
-  // CLICK
-  // ============================================================
-
-  clickElement(
-    element
-  ) {
-
-    const now =
-      Date.now();
-
-
-    if (
-      now -
-      this.eye.lastClick <
-      700
-    ) {
-
-      return;
-    }
-
-
-    this.eye.lastClick =
-      now;
-
-
-    try {
-
-      element.focus({
-        preventScroll: true
-      });
-
-    } catch (e) {
-
-      try {
-        element.focus();
-      } catch (_) {}
-    }
-
-
-    element.click();
-
-
-    const label =
-      element.innerText ||
-      element.value ||
-      element.getAttribute(
-        "aria-label"
-      ) ||
-      element.tagName;
-
-
-    this.setStatus(
-      `clique ocular: ${String(label).trim()}`
-    );
-  }
-
-  // ============================================================
-  // CLICK NA POSIÇÃO DO CURSOR
-  // ============================================================
-
-  clickAtCursor() {
-
-    const element =
-      document.elementFromPoint(
-        this.cursorPosition.x,
-        this.cursorPosition.y
-      );
-
-
-    if (!element) {
-      return;
-    }
-
-
-    const clickable =
-      element.closest(
-        `
-        button,
-        a,
-        input,
-        select,
-        textarea,
-        [role='button'],
-        label
-        `
-      );
-
-
-    if (clickable) {
-
-      this.clickElement(
-        clickable
-      );
-    }
-  }
-
-  // ============================================================
-  // CALIBRAÇÃO
-  // ============================================================
-
-  startCalibration() {
-
-    if (
-      !this.eyeEnabled
-    ) {
-
-      this.setStatus(
-        "ative a navegação por olhos antes de calibrar"
-      );
-
-      return;
-    }
-
-
-    if (
-      this.eye.calibration.active
-    ) {
-
-      return;
-    }
-
-
-    this.eye.calibration.active =
-      true;
-
-    this.eye.calibration.pointIndex =
-      0;
-
-    this.eye.calibration.samples =
-      [];
-
-
-    this.calibration.samples =
-      [];
-
-
-    this.calibration.calibrated =
-      false;
-
-
-    this.calibrationOverlay
-      .classList.add("open");
-
-
-    this.setStatus(
-      "calibração iniciada"
-    );
-
-
-    this.runCalibrationPoint();
-  }
-
-  // ============================================================
-  // PONTO DA CALIBRAÇÃO
-  // ============================================================
-
-  runCalibrationPoint() {
-
-    if (
-      !this.eye.calibration.active
-    ) {
-
-      return;
-    }
-
-
-    const index =
-      this.eye.calibration.pointIndex;
-
-
-    if (
-      index >=
-      this.calibration.points.length
-    ) {
-
-      this.finishCalibration();
-
-      return;
-    }
-
-
-    const point =
-      this.calibration.points[index];
-
-
-    const x =
-      point.x *
-      window.innerWidth;
-
-
-    const y =
-      point.y *
-      window.innerHeight;
-
-
-    this.calibrationDot.style.left =
-      `${x}px`;
-
-    this.calibrationDot.style.top =
-      `${y}px`;
-
-
-    this.calibrationInstruction.textContent =
-      "Olhe fixamente para o ponto azul";
-
-
-    this.calibrationProgress.textContent =
-      `Ponto ${index + 1} de ${this.calibration.points.length}`;
-
-
-    this.eye.calibration.samples =
-      [];
-
-
-    /*
-     * Espera um pouco para o usuário
-     * posicionar o olhar.
-     */
-
-    clearTimeout(
-      this.eye.calibration.timer
-    );
-
-
-    this.eye.calibration.timer =
-      setTimeout(
-        () => {
-
-          this.collectingCalibration =
-            true;
-
-          this.eye.calibration.samples =
-            [];
-
-          this.calibrationPointStart =
-            Date.now();
-
-        },
-
-        500
-      );
-  }
-
-  // ============================================================
-  // COLETAR AMOSTRA
-  // ============================================================
-
-  collectCalibrationSample(
-    x,
-    y
-  ) {
-
-    if (
-      !this.eye.calibration.active
-    ) {
-
-      return;
-    }
-
-
-    if (
-      !this.collectingCalibration
-    ) {
-
-      return;
-    }
-
-
-    this.eye.calibration.samples.push({
-      x,
-      y
-    });
-
-
-    if (
-      this.eye.calibration.samples.length >=
-      this.options.calibrationSamples
-    ) {
-
-      this.collectingCalibration =
-        false;
-
-
-      this.processCalibrationPoint();
-    }
-  }
-
-  // ============================================================
-  // PROCESSAR PONTO
-  // ============================================================
-
-  processCalibrationPoint() {
-
-    const samples =
-      this.eye.calibration.samples;
-
-
-    if (
-      !samples.length
-    ) {
-
-      this.eye.calibration.pointIndex++;
-
-      this.runCalibrationPoint();
-
-      return;
-    }
-
-
-    /*
-     * Remove valores extremos antes de calcular
-     * a média.
-     */
-
-    const xs =
-      samples
-        .map(
-          sample => sample.x
-        )
-        .sort(
-          (a, b) => a - b
-        );
-
-
-    const ys =
-      samples
-        .map(
-          sample => sample.y
-        )
-        .sort(
-          (a, b) => a - b
-        );
-
-
-    const trim =
-      Math.floor(
-        samples.length * 0.15
-      );
-
-
-    const filteredX =
-      xs.slice(
-        trim,
-        xs.length - trim
-      );
-
-
-    const filteredY =
-      ys.slice(
-        trim,
-        ys.length - trim
-      );
-
-
-    const avgX =
-      filteredX.reduce(
-        (sum, value) =>
-          sum + value,
-        0
-      ) /
-      Math.max(
-        filteredX.length,
-        1
-      );
-
-
-    const avgY =
-      filteredY.reduce(
-        (sum, value) =>
-          sum + value,
-        0
-      ) /
-      Math.max(
-        filteredY.length,
-        1
-      );
-
-
-    this.calibration.samples.push({
-
-      target:
-        this.calibration.points[
-          this.eye.calibration.pointIndex
-        ],
-
-      gaze: {
-        x: avgX,
-        y: avgY
-      }
-    });
-
-
-    this.eye.calibration.pointIndex++;
-
-
-    setTimeout(
-      () => this.runCalibrationPoint(),
-      300
-    );
-  }
-
-  // ============================================================
-  // FINALIZAR CALIBRAÇÃO
-  // ============================================================
-
-  finishCalibration() {
-
-    this.eye.calibration.active =
-      false;
-
-    this.collectingCalibration =
-      false;
-
-
-    clearTimeout(
-      this.eye.calibration.timer
-    );
-
-
-    const samples =
-      this.calibration.samples;
-
-
-    if (
-      samples.length < 5
-    ) {
-
-      this.calibrationOverlay
-        .classList.remove("open");
-
-
-      this.setStatus(
-        "calibração insuficiente — tente novamente"
-      );
-
-
-      return;
-    }
-
-
-    /*
-     * Descobre os extremos observados.
-     */
-
-    const xs =
-      samples.map(
-        item =>
-          item.gaze.x
-      );
-
-
-    const ys =
-      samples.map(
-        item =>
-          item.gaze.y
-      );
-
-
-    let minX =
-      Math.min(...xs);
-
-
-    let maxX =
-      Math.max(...xs);
-
-
-    let minY =
-      Math.min(...ys);
-
-
-    let maxY =
-      Math.max(...ys);
-
-
-    /*
-     * Adicionamos uma pequena margem para não
-     * deixar o cursor preso nas bordas.
-     */
-
-    const paddingX =
-      Math.max(
-        0.02,
-        (maxX - minX) * 0.08
-      );
-
-
-    const paddingY =
-      Math.max(
-        0.02,
-        (maxY - minY) * 0.08
-      );
-
-
-    minX -= paddingX;
-    maxX += paddingX;
-
-    minY -= paddingY;
-    maxY += paddingY;
-
-
-    this.calibration.minX =
-      Math.max(
-        0,
-        minX
-      );
-
-
-    this.calibration.maxX =
-      Math.min(
-        1,
-        maxX
-      );
-
-
-    this.calibration.minY =
-      Math.max(
-        0,
-        minY
-      );
-
-
-    this.calibration.maxY =
-      Math.min(
-        1,
-        maxY
-      );
-
-
-    /*
-     * Segurança contra calibração degenerada.
-     */
-
-    if (
-      this.calibration.maxX -
-      this.calibration.minX <
-      0.08
-    ) {
-
-      this.calibration.minX =
-        0.15;
-
-      this.calibration.maxX =
-        0.85;
-    }
-
-
-    if (
-      this.calibration.maxY -
-      this.calibration.minY <
-      0.08
-    ) {
-
-      this.calibration.minY =
-        0.15;
-
-      this.calibration.maxY =
-        0.85;
-    }
-
-
-    this.calibration.calibrated =
-      true;
-
-
-    this.calibrationOverlay
-      .classList.remove("open");
-
-
-    this.setStatus(
-      "calibração concluída — navegação ocular pronta"
-    );
-  }
-
-  // ============================================================
-  // CANCELAR CALIBRAÇÃO
-  // ============================================================
-
-  cancelCalibration() {
-
-    this.eye.calibration.active =
-      false;
-
-    this.collectingCalibration =
-      false;
-
-
-    clearTimeout(
-      this.eye.calibration.timer
-    );
-
-
-    this.calibrationOverlay
-      .classList.remove("open");
-
-
-    this.setStatus(
-      "calibração cancelada"
-    );
-  }
-
-  // ============================================================
-  // NAVEGAÇÃO POR VOZ
-  // ============================================================
-
-  async toggleVoice() {
-
-    if (
-      this.voiceEnabled
-    ) {
-
-      this.stopVoice();
-
-      return;
-    }
-
-
-    const SpeechRecognition =
-      window.SpeechRecognition ||
-      window.webkitSpeechRecognition;
-
-
-    if (
-      !SpeechRecognition
-    ) {
-
-      this.setStatus(
-        "reconhecimento de voz não disponível neste Chrome"
-      );
-
-      return;
-    }
-
-
-    if (
-      !window.isSecureContext
-    ) {
-
-      this.setStatus(
-        "o microfone exige HTTPS ou localhost"
-      );
-
-      return;
-    }
-
-
-    this.recognition =
-      new SpeechRecognition();
-
-
-    const recognition =
-      this.recognition;
-
-
-    recognition.lang =
-      "pt-BR";
-
-
-    recognition.continuous =
-      true;
-
-
-    recognition.interimResults =
-      false;
-
-
-    recognition.maxAlternatives =
-      3;
-
-
-    // ========================================================
-    // RESULTADO
-    // ========================================================
-
-    recognition.onresult =
-      (event) => {
-
-        for (
-          let i =
-            event.resultIndex;
-          i <
-            event.results.length;
-          i++
+        if (
+            eyeDistance < 0.001
         ) {
 
-          if (
-            !event.results[i].isFinal
-          ) {
-
-            continue;
-          }
-
-
-          const transcript =
-            event.results[i][0]
-              .transcript
-              .trim();
-
-
-          if (
-            !transcript
-          ) {
-
-            continue;
-          }
-
-
-          this.setStatus(
-            `voz: "${transcript}"`
-          );
-
-
-          this.executeVoiceCommand(
-            transcript
-          );
+            return null;
         }
-      };
 
 
-    // ========================================================
-    // ERRO
-    // ========================================================
+        // ==========================================================
+        // YAW
+        // ==========================================================
 
-    recognition.onerror =
-      (event) => {
+        const yaw =
+            (
+                nose.x -
+                eyeCenter.x
+            ) /
+            eyeDistance;
 
-        console.warn(
-          "SpeechRecognition:",
-          event.error
+
+        // ==========================================================
+        // ALTURA DO ROSTO
+        // ==========================================================
+
+        const faceHeight =
+            Math.abs(
+                chin.y -
+                forehead.y
+            );
+
+
+        if (
+            faceHeight < 0.001
+        ) {
+
+            return null;
+        }
+
+
+        // ==========================================================
+        // PITCH
+        // ==========================================================
+
+        const pitch =
+            (
+                nose.y -
+                eyeCenter.y
+            ) /
+            faceHeight;
+
+
+        return {
+            yaw,
+            pitch
+        };
+    }
+
+
+    // ==============================================================
+    // CALIBRAÇÃO
+    // ==============================================================
+
+    async startCalibration() {
+
+        if (
+            !this.cameraEnabled ||
+            this.calibrationRunning
+        ) {
+
+            return;
+        }
+
+
+        this.calibrationRunning =
+            true;
+
+        this.isCalibrated =
+            false;
+
+
+        this.cursorVelocityX = 0;
+
+        this.cursorVelocityY = 0;
+
+
+        this.calibrationOverlay.style.display =
+            "flex";
+
+
+        const points = [
+
+            {
+                name: "center",
+                x: 50,
+                y: 50,
+
+                message:
+                    "Olhe para o centro da tela e mantenha a cabeça em posição natural."
+            },
+
+            {
+                name: "left",
+                x: 15,
+                y: 50,
+
+                message:
+                    "Agora vire a cabeça lentamente para a esquerda. Não mova o corpo."
+            },
+
+            {
+                name: "right",
+                x: 85,
+                y: 50,
+
+                message:
+                    "Agora vire a cabeça lentamente para a direita."
+            },
+
+            {
+                name: "up",
+                x: 50,
+                y: 18,
+
+                message:
+                    "Agora incline a cabeça lentamente para cima."
+            },
+
+            {
+                name: "down",
+                x: 50,
+                y: 82,
+
+                message:
+                    "Agora incline a cabeça lentamente para baixo."
+            }
+        ];
+
+
+        try {
+
+            for (
+                let i = 0;
+                i < points.length;
+                i++
+            ) {
+
+                await this.calibrationPoint(
+                    points[i],
+                    i,
+                    points.length
+                );
+            }
+
+
+            // ======================================================
+            // GARANTE VALORES VÁLIDOS
+            // ======================================================
+
+            this.normalizeCalibration();
+
+
+            this.isCalibrated =
+                true;
+
+
+            this.updateCursorToCenter();
+
+
+            this.updateStatus(
+                "Calibração concluída. Mova a cabeça para controlar o cursor."
+            );
+
+
+        } finally {
+
+            this.calibrationRunning =
+                false;
+
+            this.calibrationOverlay.style.display =
+                "none";
+        }
+    }
+
+
+    // ==============================================================
+    // CALIBRATION POINT
+    // ==============================================================
+
+    async calibrationPoint(
+        point,
+        index,
+        total
+    ) {
+
+        const dot =
+            document.getElementById(
+                "a11y-calibration-dot"
+            );
+
+
+        const message =
+            document.getElementById(
+                "a11y-calibration-message"
+            );
+
+
+        const bar =
+            document.getElementById(
+                "a11y-head-calibration-bar"
+            );
+
+
+        dot.style.left =
+            `${point.x}%`;
+
+
+        dot.style.top =
+            `${point.y}%`;
+
+
+        message.textContent =
+            point.message;
+
+
+        /*
+         * Pequeno tempo para a pessoa
+         * posicionar a cabeça.
+         */
+
+        await this.wait(900);
+
+
+        /*
+         * Coleta amostras.
+         */
+
+        this.calibrationSamples =
+            [];
+
+
+        for (
+            let i = 0;
+            i < this.calibrationSampleCount;
+            i++
+        ) {
+
+            await this.wait(35);
+
+
+            if (
+                !this.cameraEnabled
+            ) {
+
+                throw new Error(
+                    "Câmera desligada durante calibração."
+                );
+            }
+
+
+            this.calibrationSamples.push({
+
+                yaw:
+                    this.filteredYaw,
+
+                pitch:
+                    this.filteredPitch
+            });
+
+
+            const localProgress =
+                (i + 1) /
+                this.calibrationSampleCount;
+
+
+            const totalProgress =
+                (
+                    index +
+                    localProgress
+                ) /
+                total;
+
+
+            bar.style.width =
+                `${totalProgress * 100}%`;
+        }
+
+
+        const yaw =
+            this.average(
+                this.calibrationSamples.map(
+                    sample =>
+                        sample.yaw
+                )
+            );
+
+
+        const pitch =
+            this.average(
+                this.calibrationSamples.map(
+                    sample =>
+                        sample.pitch
+                )
+            );
+
+
+        this.calibration[
+            `${point.name}Yaw`
+        ] = yaw;
+
+
+        this.calibration[
+            `${point.name}Pitch`
+        ] = pitch;
+    }
+
+
+    // ==============================================================
+    // NORMALIZA CALIBRAÇÃO
+    // ==============================================================
+
+    normalizeCalibration() {
+
+        const c =
+            this.calibration;
+
+
+        // ==========================================================
+        // CENTRO
+        // ==========================================================
+
+        /*
+         * Se alguma coisa deu errado,
+         * usa o valor atual.
+         */
+
+        if (
+            !Number.isFinite(
+                c.centerYaw
+            )
+        ) {
+
+            c.centerYaw =
+                this.filteredYaw;
+        }
+
+
+        if (
+            !Number.isFinite(
+                c.centerPitch
+            )
+        ) {
+
+            c.centerPitch =
+                this.filteredPitch;
+        }
+
+
+        // ==========================================================
+        // ESQUERDA
+        // ==========================================================
+
+        if (
+            !Number.isFinite(
+                c.leftYaw
+            )
+        ) {
+
+            c.leftYaw =
+                c.centerYaw -
+                0.12;
+        }
+
+
+        // ==========================================================
+        // DIREITA
+        // ==========================================================
+
+        if (
+            !Number.isFinite(
+                c.rightYaw
+            )
+        ) {
+
+            c.rightYaw =
+                c.centerYaw +
+                0.12;
+        }
+
+
+        // ==========================================================
+        // CIMA
+        // ==========================================================
+
+        if (
+            !Number.isFinite(
+                c.upPitch
+            )
+        ) {
+
+            c.upPitch =
+                c.centerPitch -
+                0.08;
+        }
+
+
+        // ==========================================================
+        // BAIXO
+        // ==========================================================
+
+        if (
+            !Number.isFinite(
+                c.downPitch
+            )
+        ) {
+
+            c.downPitch =
+                c.centerPitch +
+                0.08;
+        }
+
+
+        /*
+         * Garante amplitude mínima.
+         */
+
+        const minimum =
+            0.025;
+
+
+        if (
+            Math.abs(
+                c.rightYaw -
+                c.centerYaw
+            ) < minimum
+        ) {
+
+            c.rightYaw =
+                c.centerYaw +
+                minimum;
+        }
+
+
+        if (
+            Math.abs(
+                c.leftYaw -
+                c.centerYaw
+            ) < minimum
+        ) {
+
+            c.leftYaw =
+                c.centerYaw -
+                minimum;
+        }
+
+
+        if (
+            Math.abs(
+                c.downPitch -
+                c.centerPitch
+            ) < minimum
+        ) {
+
+            c.downPitch =
+                c.centerPitch +
+                minimum;
+        }
+
+
+        if (
+            Math.abs(
+                c.upPitch -
+                c.centerPitch
+            ) < minimum
+        ) {
+
+            c.upPitch =
+                c.centerPitch -
+                minimum;
+        }
+    }
+
+
+    // ==============================================================
+    // ATUALIZA VELOCIDADE
+    // ==============================================================
+
+    updateHeadVelocity(
+        yaw,
+        pitch
+    ) {
+
+        const normalizedX =
+            this.normalizeHorizontal(
+                yaw
+            );
+
+
+        const normalizedY =
+            this.normalizeVertical(
+                pitch
+            );
+
+
+        /*
+         * Zona morta.
+         */
+
+        const x =
+            this.applyDeadZone(
+                normalizedX,
+                this.options.deadZone
+            );
+
+
+        const y =
+            this.applyDeadZone(
+                normalizedY,
+                this.options.deadZone
+            );
+
+
+        /*
+         * Curva.
+         *
+         * Pequeno movimento =
+         * cursor lento.
+         *
+         * Grande movimento =
+         * cursor rápido.
+         */
+
+        const curvedX =
+            this.speedCurve(x);
+
+
+        const curvedY =
+            this.speedCurve(y);
+
+
+        this.cursorVelocityX =
+            curvedX *
+            this.options.maxSpeed *
+            this.options.sensitivity;
+
+
+        this.cursorVelocityY =
+            curvedY *
+            this.options.maxSpeed *
+            this.options.sensitivity;
+    }
+
+
+    // ==============================================================
+    // NORMALIZA HORIZONTAL
+    // ==============================================================
+
+    normalizeHorizontal(
+        yaw
+    ) {
+
+        const c =
+            this.calibration;
+
+
+        if (
+            yaw >= 0
+        ) {
+
+            const range =
+                c.rightYaw -
+                c.centerYaw;
+
+
+            if (
+                Math.abs(range) < 0.001
+            ) {
+
+                return 0;
+            }
+
+
+            return Math.max(
+                -1,
+                Math.min(
+                    1,
+                    yaw / range
+                )
+            );
+        }
+
+
+        const range =
+            c.leftYaw -
+            c.centerYaw;
+
+
+        if (
+            Math.abs(range) < 0.001
+        ) {
+
+            return 0;
+        }
+
+
+        return Math.max(
+            -1,
+            Math.min(
+                1,
+                yaw / Math.abs(range)
+            )
         );
+    }
+
+
+    // ==============================================================
+    // NORMALIZA VERTICAL
+    // ==============================================================
+
+    normalizeVertical(
+        pitch
+    ) {
+
+        const c =
+            this.calibration;
+
+
+        if (
+            pitch >= 0
+        ) {
+
+            const range =
+                c.downPitch -
+                c.centerPitch;
+
+
+            if (
+                Math.abs(range) < 0.001
+            ) {
+
+                return 0;
+            }
+
+
+            return Math.max(
+                -1,
+                Math.min(
+                    1,
+                    pitch / range
+                )
+            );
+        }
+
+
+        const range =
+            c.upPitch -
+            c.centerPitch;
+
+
+        if (
+            Math.abs(range) < 0.001
+        ) {
+
+            return 0;
+        }
+
+
+        return Math.max(
+            -1,
+            Math.min(
+                1,
+                pitch / Math.abs(range)
+            )
+        );
+    }
+
+
+    // ==============================================================
+    // DEAD ZONE
+    // ==============================================================
+
+    applyDeadZone(
+        value,
+        deadZone
+    ) {
+
+        const absolute =
+            Math.abs(value);
+
+
+        if (
+            absolute <= deadZone
+        ) {
+
+            return 0;
+        }
+
+
+        const sign =
+            Math.sign(value);
+
+
+        const adjusted =
+            (
+                absolute -
+                deadZone
+            ) /
+            (
+                1 -
+                deadZone
+            );
+
+
+        return (
+            sign *
+            Math.min(
+                1,
+                adjusted
+            )
+        );
+    }
+
+
+    // ==============================================================
+    // CURVA
+    // ==============================================================
+
+    speedCurve(
+        value
+    ) {
+
+        if (
+            value === 0
+        ) {
+
+            return 0;
+        }
+
+
+        const sign =
+            Math.sign(value);
+
+
+        const magnitude =
+            Math.abs(value);
+
+
+        return (
+            sign *
+            Math.pow(
+                magnitude,
+                1.6
+            )
+        );
+    }
+
+
+    // ==============================================================
+    // LOOP DO CURSOR
+    // ==============================================================
+
+    startCursorLoop() {
+
+        if (
+            this.cursorAnimationFrame
+        ) {
+
+            cancelAnimationFrame(
+                this.cursorAnimationFrame
+            );
+        }
+
+
+        const loop =
+            () => {
+
+                if (
+                    !this.cameraEnabled
+                ) {
+
+                    return;
+                }
+
+
+                this.updateCursorMovement();
+
+
+                this.cursorAnimationFrame =
+                    requestAnimationFrame(
+                        loop
+                    );
+            };
+
+
+        loop();
+    }
+
+
+    // ==============================================================
+    // MOVIMENTO DO CURSOR
+    // ==============================================================
+
+    updateCursorMovement() {
+
+        if (
+            !this.isCalibrated
+        ) {
+
+            return;
+        }
+
+
+        /*
+         * Atualiza alvo.
+         */
+
+        this.targetCursorX +=
+            this.cursorVelocityX;
+
+
+        this.targetCursorY +=
+            this.cursorVelocityY;
+
+
+        /*
+         * Limites.
+         */
+
+        const margin =
+            this.options.cursorSize / 2;
+
+
+        this.targetCursorX =
+            Math.max(
+                margin,
+                Math.min(
+                    window.innerWidth -
+                    margin,
+                    this.targetCursorX
+                )
+            );
+
+
+        this.targetCursorY =
+            Math.max(
+                margin,
+                Math.min(
+                    window.innerHeight -
+                    margin,
+                    this.targetCursorY
+                )
+            );
+
+
+        /*
+         * Suavização visual.
+         */
+
+        const smooth =
+            0.38;
+
+
+        this.cursorX +=
+            (
+                this.targetCursorX -
+                this.cursorX
+            ) *
+            smooth;
+
+
+        this.cursorY +=
+            (
+                this.targetCursorY -
+                this.cursorY
+            ) *
+            smooth;
+
+
+        this.updateCursorPosition();
+
+
+        this.updateHoveredElement();
+
+
+        this.updateDebug();
+    }
+
+
+    // ==============================================================
+    // POSIÇÃO CURSOR
+    // ==============================================================
+
+    updateCursorPosition() {
+
+        if (
+            !this.cursorElement
+        ) {
+
+            return;
+        }
+
+
+        this.cursorElement.style.left =
+            `${this.cursorX}px`;
+
+
+        this.cursorElement.style.top =
+            `${this.cursorY}px`;
+
+
+        if (
+            this.dwellElement
+        ) {
+
+            this.dwellElement.style.left =
+                `${this.cursorX}px`;
+
+            this.dwellElement.style.top =
+                `${this.cursorY}px`;
+        }
+    }
+
+
+    // ==============================================================
+    // CENTRALIZA CURSOR
+    // ==============================================================
+
+    updateCursorToCenter() {
+
+        this.cursorX =
+            window.innerWidth / 2;
+
+        this.cursorY =
+            window.innerHeight / 2;
+
+
+        this.targetCursorX =
+            this.cursorX;
+
+        this.targetCursorY =
+            this.cursorY;
+
+
+        this.cursorVelocityX = 0;
+
+        this.cursorVelocityY = 0;
+
+
+        this.updateCursorPosition();
+    }
+
+
+    // ==============================================================
+    // ELEMENTO SOB CURSOR
+    // ==============================================================
+
+    updateHoveredElement() {
+
+        const element =
+            document.elementFromPoint(
+                this.cursorX,
+                this.cursorY
+            );
+
+
+        const clickable =
+            this.findClickableElement(
+                element
+            );
+
+
+        if (
+            clickable
+        ) {
+
+            this.cursorElement
+                .classList
+                .add("clickable");
+
+
+            this.updateDwell(
+                clickable
+            );
+
+        } else {
+
+            this.cursorElement
+                .classList
+                .remove("clickable");
+
+
+            this.resetDwell();
+        }
+    }
+
+
+    // ==============================================================
+    // ENCONTRA CLICÁVEL
+    // ==============================================================
+
+    findClickableElement(
+        element
+    ) {
+
+        if (!element) {
+
+            return null;
+        }
+
+
+        const clickable =
+            element.closest(
+                [
+                    "button",
+                    "a[href]",
+                    "input",
+                    "select",
+                    "textarea",
+                    "[role='button']",
+                    "[role='link']",
+                    "[role='checkbox']",
+                    "[role='radio']",
+                    "[role='tab']"
+                ].join(",")
+            );
+
+
+        if (!clickable) {
+
+            return null;
+        }
+
+
+        if (
+            clickable.disabled ||
+            clickable.hidden
+        ) {
+
+            return null;
+        }
+
+
+        if (
+            clickable.getAttribute(
+                "aria-disabled"
+            ) === "true"
+        ) {
+
+            return null;
+        }
+
+
+        if (
+            !this.isVisible(
+                clickable
+            )
+        ) {
+
+            return null;
+        }
+
+
+        if (
+            this.isAccessibilityUI(
+                clickable
+            )
+        ) {
+
+            return null;
+        }
+
+
+        return clickable;
+    }
+
+
+    // ==============================================================
+    // VISIBILIDADE
+    // ==============================================================
+
+    isVisible(
+        element
+    ) {
+
+        const style =
+            window.getComputedStyle(
+                element
+            );
+
+
+        if (
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.opacity === "0"
+        ) {
+
+            return false;
+        }
+
+
+        const rect =
+            element.getBoundingClientRect();
+
+
+        return (
+            rect.width > 0 &&
+            rect.height > 0
+        );
+    }
+
+
+    // ==============================================================
+    // DWELL
+    // ==============================================================
+
+    updateDwell(
+        element
+    ) {
+
+        if (
+            !this.options.dwellEnabled
+        ) {
+
+            this.resetDwell();
+
+            return;
+        }
+
+
+        if (
+            this.dwellTarget === element
+        ) {
+
+            this.updateDwellVisual();
+
+            return;
+        }
+
+
+        this.resetDwell();
+
+
+        this.dwellTarget =
+            element;
+
+
+        this.dwellStartedAt =
+            performance.now();
+
+
+        this.dwellElement.style.display =
+            "block";
+
+
+        this.dwellTimer =
+            setTimeout(
+                () => {
+
+                    if (
+                        this.dwellTarget ===
+                        element
+                    ) {
+
+                        this.clickElement(
+                            element,
+                            "dwell"
+                        );
+                    }
+
+                },
+                this.options.dwellTime
+            );
+    }
+
+
+    // ==============================================================
+    // DWELL VISUAL
+    // ==============================================================
+
+    updateDwellVisual() {
+
+        if (
+            !this.dwellTarget ||
+            !this.dwellStartedAt
+        ) {
+
+            return;
+        }
+
+
+        const elapsed =
+            performance.now() -
+            this.dwellStartedAt;
+
+
+        const progress =
+            Math.min(
+                1,
+                elapsed /
+                this.options.dwellTime
+            );
+
+
+        const progressElement =
+            this.dwellElement.querySelector(
+                "#a11y-head-dwell-progress"
+            );
+
+
+        if (
+            progressElement
+        ) {
+
+            progressElement.style.transform =
+                `rotate(${
+                    -90 +
+                    progress * 360
+                }deg)`;
+        }
+    }
+
+
+    // ==============================================================
+    // RESET DWELL
+    // ==============================================================
+
+    resetDwell() {
+
+        if (
+            this.dwellTimer
+        ) {
+
+            clearTimeout(
+                this.dwellTimer
+            );
+
+            this.dwellTimer =
+                null;
+        }
+
+
+        this.dwellTarget =
+            null;
+
+
+        this.dwellStartedAt =
+            0;
+
+
+        if (
+            this.dwellElement
+        ) {
+
+            this.dwellElement.style.display =
+                "none";
+        }
+    }
+
+
+    // ==============================================================
+    // NOD
+    // ==============================================================
+
+    detectNod(
+        pitch
+    ) {
+
+        const threshold =
+            this.options.nodThreshold;
+
+
+        const now =
+            performance.now();
+
+
+        /*
+         * Começou a inclinar para baixo.
+         */
+
+        if (
+            this.nodState ===
+            "neutral"
+        ) {
+
+            if (
+                pitch >
+                threshold
+            ) {
+
+                this.nodState =
+                    "down";
+
+                this.nodStartedAt =
+                    now;
+            }
+
+
+            return;
+        }
+
+
+        /*
+         * Timeout.
+         */
+
+        if (
+            now -
+            this.nodStartedAt >
+            1200
+        ) {
+
+            this.nodState =
+                "neutral";
+
+            return;
+        }
+
+
+        /*
+         * Voltou.
+         */
+
+        if (
+            this.nodState ===
+            "down"
+        ) {
+
+            if (
+                Math.abs(pitch) <
+                threshold * .4
+            ) {
+
+                this.nodState =
+                    "neutral";
+
+
+                this.clickCurrentElement(
+                    "nod"
+                );
+            }
+        }
+    }
+
+
+    // ==============================================================
+    // CLIQUE ATUAL
+    // ==============================================================
+
+    clickCurrentElement(
+        source
+    ) {
+
+        const element =
+            document.elementFromPoint(
+                this.cursorX,
+                this.cursorY
+            );
+
+
+        const clickable =
+            this.findClickableElement(
+                element
+            );
+
+
+        if (
+            clickable
+        ) {
+
+            this.clickElement(
+                clickable,
+                source
+            );
+        }
+    }
+
+
+    // ==============================================================
+    // CLIQUE
+    // ==============================================================
+
+    clickElement(
+        element,
+        source
+    ) {
+
+        if (!element) {
+
+            return;
+        }
+
+
+        const now =
+            performance.now();
+
+
+        /*
+         * Evita duplo clique acidental.
+         */
+
+        if (
+            now -
+            this.lastClickTime <
+            this.options.clickCooldown
+        ) {
+
+            return;
+        }
+
+
+        this.lastClickTime =
+            now;
+
+
+        this.resetDwell();
+
+
+        this.cursorElement
+            .classList
+            .add("clicking");
+
+
+        setTimeout(
+            () => {
+
+                this.cursorElement
+                    .classList
+                    .remove("clicking");
+
+            },
+            220
+        );
+
+
+        try {
+
+            element.focus({
+                preventScroll:
+                    true
+            });
+
+        } catch (error) {
+
+            try {
+
+                element.focus();
+
+            } catch (_) {}
+        }
+
+
+        try {
+
+            element.click();
+
+        } catch (error) {
+
+            console.error(
+                "Erro no clique:",
+                error
+            );
+        }
+    }
+
+
+    // ==============================================================
+    // TECLADO
+    // ==============================================================
+
+    setupKeyboard() {
+
+        document.addEventListener(
+            "keydown",
+            event => {
+
+                /*
+                 * C
+                 *
+                 * recalibra
+                 */
+
+                if (
+                    event.key.toLowerCase() ===
+                    "c"
+                ) {
+
+                    if (
+                        this.cameraEnabled
+                    ) {
+
+                        this.startCalibration();
+                    }
+
+                    return;
+                }
+
+
+                /*
+                 * ENTER
+                 */
+
+                if (
+                    event.key ===
+                    "Enter"
+                ) {
+
+                    this.clickCurrentElement(
+                        "keyboard"
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * ESPAÇO
+                 */
+
+                if (
+                    event.key ===
+                    " "
+                ) {
+
+                    this.clickCurrentElement(
+                        "keyboard"
+                    );
+
+                    return;
+                }
+
+
+                /*
+                 * + aumenta sensibilidade
+                 */
+
+                if (
+                    event.key === "+"
+                ) {
+
+                    this.options.sensitivity =
+                        Math.min(
+                            3,
+                            this.options.sensitivity +
+                            0.1
+                        );
+
+                    return;
+                }
+
+
+                /*
+                 * - diminui sensibilidade
+                 */
+
+                if (
+                    event.key === "-"
+                ) {
+
+                    this.options.sensitivity =
+                        Math.max(
+                            .3,
+                            this.options.sensitivity -
+                            0.1
+                        );
+                }
+
+            }
+        );
+    }
+
+
+    // ==============================================================
+    // RESIZE
+    // ==============================================================
+
+    setupResize() {
+
+        window.addEventListener(
+            "resize",
+            () => {
+
+                const margin =
+                    this.options.cursorSize / 2;
+
+
+                this.targetCursorX =
+                    Math.max(
+                        margin,
+                        Math.min(
+                            window.innerWidth -
+                            margin,
+                            this.targetCursorX
+                        )
+                    );
+
+
+                this.targetCursorY =
+                    Math.max(
+                        margin,
+                        Math.min(
+                            window.innerHeight -
+                            margin,
+                            this.targetCursorY
+                        )
+                    );
+
+
+                this.updateCursorPosition();
+            }
+        );
+    }
+
+
+    // ==============================================================
+    // OBSERVER
+    // ==============================================================
+
+    observeDOM() {
+
+        const observer =
+            new MutationObserver(
+                () => {
+
+                    clearTimeout(
+                        this.refreshTimeout
+                    );
+
+
+                    this.refreshTimeout =
+                        setTimeout(
+                            () => {
+
+                                this.refreshInteractiveElements();
+
+                            },
+                            250
+                        );
+                }
+            );
+
+
+        observer.observe(
+            document.body,
+            {
+
+                childList: true,
+
+                subtree: true,
+
+                attributes: true,
+
+                attributeFilter: [
+
+                    "disabled",
+                    "hidden",
+                    "style",
+                    "class",
+                    "aria-hidden"
+
+                ]
+            }
+        );
+
+
+        this.domObserver =
+            observer;
+    }
+
+
+    // ==============================================================
+    // INTERATIVOS
+    // ==============================================================
+
+    refreshInteractiveElements() {
+
+        const selectors = [
+
+            "button",
+            "a[href]",
+            "input",
+            "select",
+            "textarea",
+            "[role='button']",
+            "[role='link']",
+            "[role='checkbox']",
+            "[role='radio']",
+            "[role='tab']"
+
+        ];
+
+
+        this.interactiveElements =
+            Array.from(
+                document.querySelectorAll(
+                    selectors.join(",")
+                )
+            )
+                .filter(
+                    element =>
+                        this.isVisible(
+                            element
+                        ) &&
+                        !this.isAccessibilityUI(
+                            element
+                        )
+                );
+    }
+
+
+    // ==============================================================
+    // IGNORA NOSSA INTERFACE
+    // ==============================================================
+
+    isAccessibilityUI(
+        element
+    ) {
+
+        return Boolean(
+            element.closest(
+                [
+                    "#a11y-head-panel",
+                    "#a11y-head-camera",
+                    "#a11y-head-calibration",
+                    "#a11y-head-cursor",
+                    "#a11y-head-dwell",
+                    "#a11y-head-debug"
+                ].join(",")
+            )
+        );
+    }
+
+
+    // ==============================================================
+    // STATUS
+    // ==============================================================
+
+    updateStatus(
+        message
+    ) {
+
+        if (
+            this.statusElement
+        ) {
+
+            this.statusElement.textContent =
+                message;
+        }
+    }
+
+
+    // ==============================================================
+    // DEBUG
+    // ==============================================================
+
+    updateDebug() {
+
+        if (
+            !this.debugElement
+        ) {
+
+            return;
+        }
+
+
+        if (
+            !this.isCalibrated
+        ) {
+
+            return;
+        }
+
+
+        const yaw =
+            this.filteredYaw -
+            this.calibration.centerYaw;
+
+
+        const pitch =
+            this.filteredPitch -
+            this.calibration.centerPitch;
+
+
+        this.debugElement.innerHTML = `
+
+            YAW:
+            ${yaw.toFixed(3)}
+
+            <br>
+
+            PITCH:
+            ${pitch.toFixed(3)}
+
+            <br>
+
+            VX:
+            ${this.cursorVelocityX.toFixed(2)}
+
+            <br>
+
+            VY:
+            ${this.cursorVelocityY.toFixed(2)}
+
+        `;
+    }
+
+
+    // ==============================================================
+    // UTILITÁRIOS
+    // ==============================================================
+
+    average(
+        values
+    ) {
+
+        if (
+            !values.length
+        ) {
+
+            return 0;
+        }
+
+
+        return (
+            values.reduce(
+                (
+                    total,
+                    value
+                ) =>
+                    total + value,
+                0
+            ) /
+            values.length
+        );
+    }
+
+
+    wait(
+        milliseconds
+    ) {
+
+        return new Promise(
+            resolve =>
+                setTimeout(
+                    resolve,
+                    milliseconds
+                )
+        );
+    }
+
+
+    // ==============================================================
+    // ERROR
+    // ==============================================================
+
+    getErrorMessage(
+        error
+    ) {
+
+        if (!error) {
+
+            return "Erro desconhecido.";
+        }
 
 
         switch (
-          event.error
+            error.name
         ) {
 
-          case "not-allowed":
+            case "NotAllowedError":
 
-            this.voiceEnabled =
-              false;
-
-            this.panel
-              .querySelector(
-                "#a11y-voice-toggle"
-              )
-              .textContent =
-              "Ativar";
+                return (
+                    "Permissão da câmera negada. " +
+                    "Permita a câmera no Chrome."
+                );
 
 
-            this.setStatus(
-              "permissão do microfone negada"
-            );
+            case "NotFoundError":
 
-            break;
-
-
-          case "service-not-allowed":
-
-            this.voiceEnabled =
-              false;
-
-            this.panel
-              .querySelector(
-                "#a11y-voice-toggle"
-              )
-              .textContent =
-              "Ativar";
+                return (
+                    "Nenhuma câmera foi encontrada."
+                );
 
 
-            this.setStatus(
-              "serviço de reconhecimento de voz não permitido"
-            );
+            case "NotReadableError":
 
-            break;
-
-
-          case "audio-capture":
-
-            this.voiceEnabled =
-              false;
-
-            this.panel
-              .querySelector(
-                "#a11y-voice-toggle"
-              )
-              .textContent =
-              "Ativar";
+                return (
+                    "A câmera está sendo usada " +
+                    "por outro aplicativo."
+                );
 
 
-            this.setStatus(
-              "não foi possível acessar o microfone"
-            );
+            case "SecurityError":
 
-            break;
-
-
-          case "no-speech":
-
-            this.setStatus(
-              "nenhuma fala detectada"
-            );
-
-            break;
+                return (
+                    "A câmera exige HTTPS."
+                );
 
 
-          case "network":
+            default:
 
-            this.setStatus(
-              "erro de rede no reconhecimento de voz"
-            );
-
-            break;
-
-
-          case "aborted":
-
-            break;
-
-
-          default:
-
-            this.setStatus(
-              `erro de voz: ${event.error}`
-            );
+                return (
+                    error.message ||
+                    "Não foi possível iniciar a câmera."
+                );
         }
-      };
+    }
 
 
-    // ========================================================
-    // FIM DA SESSÃO
-    // ========================================================
+    // ==============================================================
+    // API PÚBLICA
+    // ==============================================================
 
-    recognition.onend =
-      () => {
+    enable() {
+
+        return this.startCamera();
+    }
+
+
+    disable() {
+
+        this.stopCamera();
+    }
+
+
+    recalibrate() {
 
         if (
-          !this.voiceEnabled ||
-          this.recognition !==
-            recognition
+            this.cameraEnabled
         ) {
 
-          return;
+            return this.startCalibration();
         }
-
-
-        clearTimeout(
-          this.voiceRestartTimer
-        );
-
-
-        this.voiceRestartTimer =
-          setTimeout(
-            () => {
-
-              if (
-                !this.voiceEnabled ||
-                this.recognition !==
-                  recognition
-              ) {
-
-                return;
-              }
-
-
-              try {
-
-                recognition.start();
-
-              } catch (error) {
-
-                /*
-                 * Chrome pode lançar InvalidStateError
-                 * quando start() é chamado enquanto
-                 * o reconhecimento ainda está encerrando.
-                 */
-
-                console.warn(
-                  "Não foi possível reiniciar:",
-                  error
-                );
-              }
-
-            },
-
-            500
-          );
-      };
-
-
-    // ========================================================
-    // START
-    // ========================================================
-
-    try {
-
-      this.voiceEnabled =
-        true;
-
-
-      recognition.start();
-
-
-      this.panel
-        .querySelector(
-          "#a11y-voice-toggle"
-        )
-        .textContent =
-        "Desativar";
-
-
-      this.setStatus(
-        "escutando comandos de voz..."
-      );
-
-    } catch (error) {
-
-      console.error(
-        "Erro ao iniciar voz:",
-        error
-      );
-
-
-      this.voiceEnabled =
-        false;
-
-
-      this.panel
-        .querySelector(
-          "#a11y-voice-toggle"
-        )
-        .textContent =
-        "Ativar";
-
-
-      this.setStatus(
-        "não foi possível iniciar o reconhecimento de voz"
-      );
     }
-  }
-
-  // ============================================================
-  // PARAR VOZ
-  // ============================================================
-
-  stopVoice() {
-
-    this.voiceEnabled =
-      false;
 
 
-    clearTimeout(
-      this.voiceRestartTimer
-    );
-
-
-    this.voiceRestartTimer =
-      null;
-
-
-    if (
-      this.recognition
+    setSensitivity(
+        value
     ) {
 
-      try {
-
-        this.recognition.onend =
-          null;
-
-        this.recognition.stop();
-
-      } catch (error) {
-
-        console.warn(error);
-      }
-
-
-      this.recognition =
-        null;
-    }
-
-
-    const button =
-      this.panel?.querySelector(
-        "#a11y-voice-toggle"
-      );
-
-
-    if (button) {
-
-      button.textContent =
-        "Ativar";
-    }
-
-
-    this.setStatus(
-      "navegação por voz desativada"
-    );
-  }
-
-  // ============================================================
-  // EXECUTAR COMANDO DE VOZ
-  // ============================================================
-
-  executeVoiceCommand(
-    command
-  ) {
-
-    const text =
-      this.normalizeText(
-        command
-      );
-
-
-    // --------------------------------------------------------
-    // CLICAR
-    // --------------------------------------------------------
-
-    if (
-      text.startsWith(
-        "clicar em "
-      ) ||
-      text.startsWith(
-        "clique em "
-      )
-    ) {
-
-      const targetName =
-        text.replace(
-          /^cli(?:car|que) em /,
-          ""
-        ).trim();
-
-
-      this.clickByText(
-        targetName
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // PREENCHER
-    // --------------------------------------------------------
-
-    if (
-      text.startsWith(
-        "preencher "
-      )
-    ) {
-
-      this.fillFieldByVoice(
-        command.trim()
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // ROLAR PARA BAIXO
-    // --------------------------------------------------------
-
-    if (
-      text.includes(
-        "rolar para baixo"
-      ) ||
-      text.includes(
-        "descer"
-      ) ||
-      text ===
-        "baixo"
-    ) {
-
-      window.scrollBy({
-
-        top:
-          window.innerHeight *
-          0.75,
-
-        behavior:
-          "smooth"
-      });
-
-
-      this.setStatus(
-        "rolando para baixo"
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // ROLAR PARA CIMA
-    // --------------------------------------------------------
-
-    if (
-      text.includes(
-        "rolar para cima"
-      ) ||
-      text.includes(
-        "subir"
-      ) ||
-      text ===
-        "cima"
-    ) {
-
-      window.scrollBy({
-
-        top:
-          -window.innerHeight *
-          0.75,
-
-        behavior:
-          "smooth"
-      });
-
-
-      this.setStatus(
-        "rolando para cima"
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // VOLTAR
-    // --------------------------------------------------------
-
-    if (
-      text ===
-      "voltar"
-    ) {
-
-      history.back();
-
-
-      this.setStatus(
-        "voltando"
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // TOPO
-    // --------------------------------------------------------
-
-    if (
-      text ===
-        "ir para o topo" ||
-      text ===
-        "voltar ao topo" ||
-      text ===
-        "topo"
-    ) {
-
-      window.scrollTo({
-
-        top: 0,
-
-        behavior:
-          "smooth"
-      });
-
-
-      this.setStatus(
-        "voltando ao topo"
-      );
-
-
-      return;
-    }
-
-
-    // --------------------------------------------------------
-    // PARAR VOZ
-    // --------------------------------------------------------
-
-    if (
-      text ===
-        "parar voz" ||
-      text ===
-        "parar reconhecimento"
-    ) {
-
-      this.stopVoice();
-
-
-      return;
-    }
-
-
-    this.setStatus(
-      `comando não reconhecido: "${command}"`
-    );
-  }
-
-  // ============================================================
-  // NORMALIZAR TEXTO
-  // ============================================================
-
-  normalizeText(
-    text
-  ) {
-
-    return String(text)
-
-      .toLowerCase()
-
-      .normalize("NFD")
-
-      .replace(
-        /[\u0300-\u036f]/g,
-        ""
-      )
-
-      .replace(
-        /\s+/g,
-        " "
-      )
-
-      .trim();
-  }
-
-  // ============================================================
-  // CLICAR POR TEXTO
-  // ============================================================
-
-  clickByText(
-    targetName
-  ) {
-
-    const normalizedTarget =
-      this.normalizeText(
-        targetName
-      );
-
-
-    const candidates = [
-
-      ...document.querySelectorAll(
-        `
-        button,
-        a,
-        [role='button'],
-        input[type='submit'],
-        input[type='button']
-        `
-      )
-    ];
-
-
-    const target =
-      candidates.find(
-        el => {
-
-          const label =
-            this.normalizeText(
-
-              el.innerText ||
-
-              el.value ||
-
-              el.getAttribute(
-                "aria-label"
-              ) ||
-
-              el.getAttribute(
-                "title"
-              ) ||
-
-              ""
+        this.options.sensitivity =
+            Math.max(
+                .3,
+                Math.min(
+                    3,
+                    Number(value)
+                )
             );
-
-
-          return (
-            label ===
-              normalizedTarget ||
-
-            label.includes(
-              normalizedTarget
-            )
-          );
-        }
-      );
-
-
-    if (target) {
-
-      try {
-
-        target.focus({
-          preventScroll:
-            true
-        });
-
-      } catch (_) {}
-
-
-      target.click();
-
-
-      this.setStatus(
-        `clicou em "${targetName}"`
-      );
-
-    } else {
-
-      this.setStatus(
-        `não encontrei "${targetName}"`
-      );
-    }
-  }
-
-  // ============================================================
-  // PREENCHER CAMPO
-  // ============================================================
-
-  fillFieldByVoice(
-    text
-  ) {
-
-    /*
-     * Exemplo:
-     *
-     * preencher nome com Lucas Gabriel
-     */
-
-    const match =
-      text.match(
-        /^preencher (.+?) com (.+)$/i
-      );
-
-
-    if (!match) {
-
-      this.setStatus(
-        "use: preencher [campo] com [valor]"
-      );
-
-
-      return;
     }
 
 
-    const fieldName =
-      this.normalizeText(
-        match[1].trim()
-      );
+    setDwellTime(
+        milliseconds
+    ) {
 
-
-    const value =
-      match[2].trim();
-
-
-    const fields = [
-
-      ...document.querySelectorAll(
-        "input, textarea, select"
-      )
-
-    ];
-
-
-    const field =
-      fields.find(
-        el => {
-
-          const label =
-            this.getFieldLabel(
-              el
+        this.options.dwellTime =
+            Math.max(
+                300,
+                Number(milliseconds)
             );
-
-
-          return label.includes(
-            fieldName
-          );
-        }
-      );
-
-
-    if (!field) {
-
-      this.setStatus(
-        `campo "${fieldName}" não encontrado`
-      );
-
-
-      return;
     }
-
-
-    // --------------------------------------------------------
-    // SELECT
-    // --------------------------------------------------------
-
-    if (
-      field.tagName ===
-      "SELECT"
-    ) {
-
-      const normalizedValue =
-        this.normalizeText(
-          value
-        );
-
-
-      const option =
-        [
-          ...field.options
-        ].find(
-          option =>
-            this.normalizeText(
-              option.textContent
-            ).includes(
-              normalizedValue
-            )
-        );
-
-
-      if (!option) {
-
-        this.setStatus(
-          `opção "${value}" não encontrada`
-        );
-
-
-        return;
-      }
-
-
-      field.value =
-        option.value;
-
-
-      field.dispatchEvent(
-        new Event(
-          "input",
-          {
-            bubbles:
-              true
-          }
-        )
-      );
-
-
-      field.dispatchEvent(
-        new Event(
-          "change",
-          {
-            bubbles:
-              true
-          }
-        )
-      );
-
-    } else {
-
-      // ------------------------------------------------------
-      // INPUT / TEXTAREA
-      // ------------------------------------------------------
-
-      const prototype =
-        field instanceof
-        HTMLTextAreaElement
-
-          ? HTMLTextAreaElement.prototype
-
-          : HTMLInputElement.prototype;
-
-
-      const setter =
-        Object.getOwnPropertyDescriptor(
-          prototype,
-          "value"
-        )?.set;
-
-
-      if (setter) {
-
-        setter.call(
-          field,
-          value
-        );
-
-      } else {
-
-        field.value =
-          value;
-      }
-
-
-      field.dispatchEvent(
-        new Event(
-          "input",
-          {
-            bubbles:
-              true
-          }
-        )
-      );
-
-
-      field.dispatchEvent(
-        new Event(
-          "change",
-          {
-            bubbles:
-              true
-          }
-        )
-      );
-    }
-
-
-    try {
-
-      field.focus({
-        preventScroll:
-          true
-      });
-
-    } catch (_) {
-
-      field.focus();
-    }
-
-
-    this.setStatus(
-      `preenchido: ${fieldName}`
-    );
-  }
-
-  // ============================================================
-  // IDENTIFICAR LABEL DO CAMPO
-  // ============================================================
-
-  getFieldLabel(
-    field
-  ) {
-
-    if (
-      field.labels?.length
-    ) {
-
-      return this.normalizeText(
-        field.labels[0].innerText
-      );
-    }
-
-
-    /*
-     * Procura também um label associado
-     * pelo atributo for.
-     */
-
-    if (field.id) {
-
-      const label =
-        document.querySelector(
-          `label[for="${CSS.escape(field.id)}"]`
-        );
-
-
-      if (label) {
-
-        return this.normalizeText(
-          label.innerText
-        );
-      }
-    }
-
-
-    return this.normalizeText(
-
-      [
-
-        field.name,
-
-        field.id,
-
-        field.placeholder,
-
-        field.getAttribute(
-          "aria-label"
-        ),
-
-        field.getAttribute(
-          "title"
-        )
-
-      ]
-
-        .filter(Boolean)
-
-        .join(" ")
-    );
-  }
 }
 
 
-// ============================================================
-// INICIALIZAÇÃO AUTOMÁTICA
-// ============================================================
+/* =================================================================
+   INICIALIZAÇÃO
+   ================================================================= */
 
 document.addEventListener(
-  "DOMContentLoaded",
-  () => {
+    "DOMContentLoaded",
+    () => {
 
-    /*
-     * Evita criar duas instâncias caso
-     * o script seja carregado duas vezes.
-     */
+        window.accessibilityMVP =
+            new AccessibilityMVP({
 
-    if (
-      window.accessibilityMVP
-    ) {
+                cursorSize:
+                    34,
 
-      return;
+                maxSpeed:
+                    15,
+
+                sensitivity:
+                    1.0,
+
+                deadZone:
+                    0.08,
+
+                smoothing:
+                    0.22,
+
+                dwellEnabled:
+                    true,
+
+                dwellTime:
+                    1400,
+
+                nodEnabled:
+                    true,
+
+                nodThreshold:
+                    0.07,
+
+                clickCooldown:
+                    700,
+
+                showPanel:
+                    true,
+
+                showCameraPreview:
+                    true
+            });
     }
-
-
-    window.accessibilityMVP =
-      new AccessibilityMVP();
-
-
-    window.accessibilityMVP.init();
-  }
 );
